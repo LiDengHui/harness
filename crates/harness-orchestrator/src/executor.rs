@@ -823,13 +823,19 @@ impl Executor {
                         }
                         Ok(report) => {
                             let valid = report.valid;
+                            let checked = report.checked;
                             let issues = render_issues(&report);
                             let rendered = serde_json::to_string(&result)
                                 .unwrap_or_else(|_| run.final_text.clone());
                             outcome.result = Some(result);
                             outcome.verification = Some(report);
 
-                            if valid {
+                            // An unchecked report is not a failure: nothing
+                            // contradicted the worker, and rejecting work over a
+                            // check that never ran would fail every run that
+                            // configured none. The report still rides along, so
+                            // the summary can say the node was never verified.
+                            if valid || !checked {
                                 let state = outcome
                                     .result
                                     .as_ref()
@@ -1352,6 +1358,7 @@ mod tests {
     fn a_report_with_no_detail_still_produces_feedback() {
         let report = VerificationReport {
             valid: false,
+            checked: true,
             checks: Vec::new(),
             issues: Vec::new(),
         };
@@ -1362,6 +1369,7 @@ mod tests {
     fn failed_checks_and_issues_are_both_rendered() {
         let report = VerificationReport {
             valid: false,
+            checked: true,
             checks: vec![CheckOutcome {
                 name: "cargo check".into(),
                 passed: false,

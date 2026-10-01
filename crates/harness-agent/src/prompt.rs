@@ -27,6 +27,15 @@ pub const AGENTS_MAX_BYTES: usize = 8 * 1024;
 /// How much of a manifest is scanned to recover the project's name.
 const MANIFEST_SCAN_BYTES: usize = 16 * 1024;
 
+/// How many dependency versions the block reports before it stops.
+///
+/// The line is context, not an inventory: enough to anchor the versions that
+/// change what the model writes, without crowding the conversation.
+const INSTALLED_MAX: usize = 24;
+
+/// How much of a lockfile is scanned for dependency versions.
+const INSTALLED_SCAN_BYTES: usize = 1024 * 1024;
+
 /// The marker files that identify a project, cheapest and most specific first.
 const PROJECT_MARKERS: &[(&str, &str)] = &[
     ("Cargo.toml", "Rust"),
@@ -50,6 +59,13 @@ pub struct Environment {
     pub date: String,
     /// One line naming the project, when a marker file identifies it.
     pub project: Option<String>,
+    /// `name version` for each dependency, as it exists on disk.
+    ///
+    /// A declared range is not what is installed: a manifest asking for
+    /// `^1.6.4` resolves to whatever the lockfile or `node_modules` holds, and
+    /// a model that reads the range alone describes behaviour the project does
+    /// not have.
+    pub installed: Vec<String>,
     /// The workspace-root `AGENTS.md`, already bounded to [`AGENTS_MAX_BYTES`].
     pub agents_md: Option<String>,
 }
@@ -68,6 +84,7 @@ impl Environment {
             shell: shell.to_string(),
             date: today(),
             project: detect_project(workspace_root),
+            installed: installed_dependencies(workspace_root),
             agents_md: read_bounded(&workspace_root.join(AGENTS_FILE), AGENTS_MAX_BYTES),
         }
     }
@@ -112,6 +129,12 @@ pub fn assemble(body: &str, env: &Environment, skills: &[SkillSummary]) -> Strin
         "- Project: {}",
         env.project.as_deref().unwrap_or("not recognised")
     );
+    let installed = if env.installed.is_empty() {
+        "not detected".to_string()
+    } else {
+        env.installed.join(", ")
+    };
+    let _ = writeln!(prompt, "- Installed dependencies: {installed}");
     prompt.push_str(platform_note(&env.os));
 
     if !skills.is_empty() {
@@ -123,7 +146,13 @@ pub fn assemble(body: &str, env: &Environment, skills: &[SkillSummary]) -> Strin
          - When the request is a question, a critique or a review, answer it from what you \
          read and change nothing.\n\
          - Only modify files when the request asks for a change, and say which files you \
-         changed.\n",
+         changed.\n\
+         - A command exiting 0, a file existing and a string matching are evidence that \
+         output was produced, not that a feature works.\n\
+         - Before you claim a feature works, exercise the path that would break if it did \
+         not, and quote what you observed.\n\
+         - When only production evidence exists, say the feature is unverified rather than \
+         calling it working.\n",
     );
 
     if let Some(instructions) = &env.agents_md {
@@ -238,6 +267,19 @@ fn detect_project(root: &Path) -> Option<String> {
     None
 }
 
+/// The `version` of a package as its own `package.json` declares it.
+///
+/// Parsed rather than line-scanned: a `node_modules` manifest is not
+/// guaranteed to be pretty-printed, and the first `:` in a minified one belongs
+/// to whichever key happens to come first.
+fn node_package_version(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    json.get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// The `name` value of a manifest, when its first `name` key is a plain string.
 fn manifest_name(path: &Path) -> Option<String> {
     let text = read_bounded(path, MANIFEST_SCAN_BYTES)?;
@@ -246,8 +288,13 @@ fn manifest_name(path: &Path) -> Option<String> {
 
 /// `name = "x"` (TOML) or `"name": "x"` (JSON) on one line, as `x`.
 fn name_value(line: &str) -> Option<String> {
-    let (key, rest) = line.split_once(['=', ':'])?;
-    if key.trim().trim_matches('"') != "name" {
+    key_value(line, "name")
+}
+
+/// `key = "x"` (TOML) or `"key": "x"` (JSON) on one line, as `x`.
+fn key_value(line: &str, key: &str) -> Option<String> {
+    let (found, rest) = line.split_once(['=', ':'])?;
+    if found.trim().trim_matches('"') != key {
         return None;
     }
     let value = rest
@@ -257,6 +304,220 @@ fn name_value(line: &str) -> Option<String> {
         .trim_matches('"')
         .trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The dependencies that are actually on disk, as `name version`.
+///
+/// The manifest supplies the names and the lockfile or `node_modules` supplies
+/// the version, because the declared range is not the installed one: a model
+/// that reads `^1.6.4` alone reaches for the 2.0 documentation and describes
+/// behaviour the project does not have. Everything here is best-effort — a
+/// missing or malformed manifest yields an empty list rather than an error,
+/// since a broken dependency line must never cost the agent its prompt.
+fn installed_dependencies(root: &Path) -> Vec<String> {
+    if root.join("Cargo.toml").is_file() {
+        let rust = rust_dependencies(root);
+        if !rust.is_empty() {
+            return rust;
+        }
+    }
+    if root.join("package.json").is_file() {
+        return node_dependencies(root);
+    }
+    Vec::new()
+}
+
+/// Rust dependencies, named by `Cargo.toml` and versioned by `Cargo.lock`.
+fn rust_dependencies(root: &Path) -> Vec<String> {
+    let Some(manifest) = read_bounded(&root.join("Cargo.toml"), INSTALLED_SCAN_BYTES) else {
+        return Vec::new();
+    };
+    let Some(lock) = read_bounded(&root.join("Cargo.lock"), INSTALLED_SCAN_BYTES) else {
+        return Vec::new();
+    };
+    let versions = lock_versions(&lock);
+    let mut installed = Vec::new();
+    for (name, requirement) in manifest_dependencies(&manifest) {
+        let Some(version) = locked_version(&versions, &name, requirement.as_deref()) else {
+            continue;
+        };
+        installed.push(format!("{name} {version}"));
+        if installed.len() >= INSTALLED_MAX {
+            break;
+        }
+    }
+    installed
+}
+
+/// Node dependencies, named by `package.json` and versioned by the copy of each
+/// package that `node_modules` holds.
+///
+/// A name whose on-disk copy cannot be read is dropped rather than reported at
+/// its declared range: the whole point of the line is to state what is there.
+fn node_dependencies(root: &Path) -> Vec<String> {
+    let Some(manifest) = std::fs::read_to_string(root.join("package.json")).ok() else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for key in ["dependencies", "devDependencies"] {
+        let Some(table) = json.get(key).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for name in table.keys() {
+            if !names.iter().any(|seen| seen == name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    let mut installed = Vec::new();
+    for name in names {
+        let path = root.join("node_modules").join(&name).join("package.json");
+        let Some(version) = node_package_version(&path) else {
+            continue;
+        };
+        installed.push(format!("{name} {version}"));
+        if installed.len() >= INSTALLED_MAX {
+            break;
+        }
+    }
+    installed
+}
+
+/// The dependencies a `Cargo.toml` declares, in the order it declares them,
+/// each with the version requirement it states.
+fn manifest_dependencies(manifest: &str) -> Vec<(String, Option<String>)> {
+    let mut dependencies = Vec::new();
+    let mut in_dependencies = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed.strip_prefix('[') {
+            let section = section.trim_end_matches(']').trim().trim_matches('"');
+            // `[dependencies.foo]` names its dependency in the header itself,
+            // and its body is the dependency's own keys, not more dependencies.
+            if let Some(name) = section
+                .strip_prefix("dependencies.")
+                .or_else(|| section.strip_prefix("dev-dependencies."))
+                .or_else(|| section.strip_prefix("build-dependencies."))
+            {
+                dependencies.push((name.to_string(), None));
+                in_dependencies = false;
+                continue;
+            }
+            in_dependencies = section == "dependencies"
+                || section == "dev-dependencies"
+                || section == "build-dependencies"
+                || section.ends_with(".dependencies")
+                || section.ends_with(".dev-dependencies")
+                || section.ends_with(".build-dependencies");
+            continue;
+        }
+        if !in_dependencies || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            let name = key.trim().trim_matches('"').trim();
+            if !name.is_empty() {
+                dependencies.push((name.to_string(), declared_requirement(value)));
+            }
+        }
+    }
+    dependencies
+}
+
+/// The version requirement a dependency line declares, when it declares one.
+///
+/// `foo = "1"` states it plainly; `foo = { version = "1", features = [...] }`
+/// buries it in an inline table; `foo = { path = "..." }` has none, because a
+/// path dependency carries its version in its own manifest.
+fn declared_requirement(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(table) = value.strip_prefix('{') {
+        return table
+            .split(',')
+            .find_map(|entry| key_value(entry, "version"));
+    }
+    let plain = value.trim_matches('"').trim();
+    (!plain.is_empty()).then(|| plain.to_string())
+}
+
+/// The lockfile version that answers for `name`.
+///
+/// A lockfile can hold several versions of one package — a transitive
+/// dependency pins an old one while the direct dependency uses a newer — so the
+/// declared requirement decides which is meant. Without a usable requirement
+/// the newest wins, on the assumption that the dependency doing the asking is
+/// the one that was updated.
+fn locked_version(
+    versions: &[(String, String)],
+    name: &str,
+    requirement: Option<&str>,
+) -> Option<String> {
+    let candidates: Vec<&str> = versions
+        .iter()
+        .filter(|(package, _)| package == name)
+        .map(|(_, version)| version.as_str())
+        .collect();
+    if let Some(prefix) = requirement.and_then(version_prefix) {
+        let dotted = format!("{prefix}.");
+        let satisfying: Vec<&str> = candidates
+            .iter()
+            .copied()
+            .filter(|version| *version == prefix || version.starts_with(&dotted))
+            .collect();
+        if let Some(version) = highest(satisfying) {
+            return Some(version.to_string());
+        }
+    }
+    highest(candidates).map(str::to_string)
+}
+
+/// The leading numeric part of a requirement, e.g. `^1.6.4` becomes `1.6.4`.
+fn version_prefix(requirement: &str) -> Option<String> {
+    let prefix: String = requirement
+        .trim_start_matches(['^', '~', '=', '>', '<', ' ', '*'])
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    let prefix = prefix.trim_end_matches('.');
+    (!prefix.is_empty()).then(|| prefix.to_string())
+}
+
+/// The greatest of a set of version strings.
+fn highest(versions: Vec<&str>) -> Option<&str> {
+    versions
+        .into_iter()
+        .max_by_key(|version| version_key(version))
+}
+
+/// A version as its numeric components, so `2.0.21` outranks `1.0.69`.
+fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-', '+'])
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// `(name, version)` for every package in a `Cargo.lock`.
+fn lock_versions(lock: &str) -> Vec<(String, String)> {
+    let mut versions = Vec::new();
+    let mut name: Option<String> = None;
+    for line in lock.lines() {
+        if line.trim_start().starts_with("[[package]]") {
+            name = None;
+        } else if let Some(value) = key_value(line, "name") {
+            name = Some(value);
+        } else if let Some(version) = key_value(line, "version") {
+            // The lockfile's own `version = 3` header precedes any package and
+            // must not be read as one.
+            if let Some(package) = name.take() {
+                versions.push((package, version));
+            }
+        }
+    }
+    versions
 }
 
 /// Reads at most `limit` bytes of a file, cutting on a character boundary.
@@ -325,6 +586,7 @@ mod tests {
             shell: "`cmd /C`".to_string(),
             date: "2026-10-01".to_string(),
             project: Some("Rust project `demo` (Cargo.toml)".to_string()),
+            installed: Vec::new(),
             agents_md: None,
         }
     }
@@ -379,6 +641,108 @@ mod tests {
         assert!(assembled.contains("change nothing"), "{assembled}");
         assert!(
             assembled.contains("Only modify files when the request asks for a change"),
+            "{assembled}"
+        );
+    }
+
+    #[test]
+    fn the_working_agreement_requires_behavioural_evidence() {
+        let assembled = assemble("body", &env(Path::new(".")));
+        assert!(
+            assembled.contains("not that a feature works"),
+            "a green build must not read as a working feature: {assembled}"
+        );
+        assert!(
+            assembled.contains("exercise the path that would break"),
+            "{assembled}"
+        );
+        assert!(
+            assembled.contains("say the feature is unverified"),
+            "{assembled}"
+        );
+    }
+
+    #[test]
+    fn installed_dependencies_report_the_version_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"vitepress":"^1.6.4"},"devDependencies":{"vue":"^3.5.0"}}"#,
+        )
+        .unwrap();
+        let vitepress = dir.path().join("node_modules").join("vitepress");
+        std::fs::create_dir_all(&vitepress).unwrap();
+        std::fs::write(
+            vitepress.join("package.json"),
+            r#"{"name":"vitepress","version":"1.6.4"}"#,
+        )
+        .unwrap();
+
+        // The installed version, not the declared range, and nothing for a
+        // dependency whose copy is not on disk.
+        assert_eq!(
+            installed_dependencies(dir.path()),
+            vec!["vitepress 1.6.4".to_string()]
+        );
+    }
+
+    #[test]
+    fn installed_dependencies_come_from_a_lockfile_for_rust() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[dependencies]\nserde_json = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nname = \"serde_json\"\nversion = \"1.0.140\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"abc\"\n",
+        )
+        .unwrap();
+
+        // The `[package]` name and the lockfile's own format version are not
+        // dependencies.
+        assert_eq!(
+            installed_dependencies(dir.path()),
+            vec!["serde_json 1.0.140".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_locked_version_matching_the_requirement_beats_an_older_pin() {
+        let versions = vec![
+            ("thiserror".to_string(), "1.0.69".to_string()),
+            ("thiserror".to_string(), "2.0.21".to_string()),
+        ];
+        // The declared `thiserror = "2"` picks the 2.x entry, not the older
+        // copy a transitive dependency pinned.
+        assert_eq!(
+            locked_version(&versions, "thiserror", Some("2")).as_deref(),
+            Some("2.0.21")
+        );
+        // With no requirement to match on, the newest is the direct one.
+        assert_eq!(
+            locked_version(&versions, "thiserror", None).as_deref(),
+            Some("2.0.21")
+        );
+        assert_eq!(
+            locked_version(&versions, "thiserror", Some("^1.0")).as_deref(),
+            Some("1.0.69")
+        );
+    }
+
+    #[test]
+    fn installed_dependencies_degrade_without_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(installed_dependencies(dir.path()).is_empty());
+
+        let detected = Environment::detect(dir.path(), "`sh -c`");
+        assert!(detected.installed.is_empty());
+        let assembled = assemble("body", &detected);
+        assert!(
+            assembled.contains("Installed dependencies: not detected"),
             "{assembled}"
         );
     }

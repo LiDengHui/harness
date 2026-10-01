@@ -24,10 +24,11 @@ use harness_guardrails::{
 };
 use harness_llm::Provider;
 use harness_memory::SqliteMemory;
+use harness_orchestrator::{SubtaskResult, TaskNode, VerificationReport};
 use harness_tools::{ToolContext, ToolRegistry};
 use tokio::sync::mpsc;
 
-use crate::commands::RunCommand;
+use crate::commands::{build_verifier, resolve_verify_checks, RunCommand};
 use crate::context::AppContext;
 
 /// Used only when a workspace has no `.agent.md` files at all.
@@ -119,7 +120,7 @@ pub(crate) async fn execute(command: RunCommand, ctx: &AppContext) -> anyhow::Re
     let (control_handle, mut control) = harness_agent::ControlHandle::channel();
     install_ctrl_c_handler(control_handle);
 
-    let mut history = vec![Message::user(prompt)];
+    let mut history = vec![Message::user(prompt.clone())];
     // Persisted turn by turn rather than once at the end: an abort, a provider
     // error or a killed process must not lose the whole conversation. The loop
     // hands each turn to the recorder as it completes, so nothing is appended
@@ -132,12 +133,29 @@ pub(crate) async fn execute(command: RunCommand, ctx: &AppContext) -> anyhow::Re
     drop(events);
     let _ = printer.await;
 
-    summarize(&outcome, &spec.id, &resolved.model, session_id);
+    // The gate runs after the transcript is complete: what it checks is the
+    // workspace the run left behind, not what the run said about it.
+    let verification = verify_run(&command, ctx, &provider, &prompt, &outcome).await?;
+
+    summarize(
+        &outcome,
+        &spec.id,
+        &resolved.model,
+        session_id,
+        verification.as_ref(),
+    );
 
     match outcome.reason {
-        CompletionReason::EndTurn => Ok(()),
-        other => Err(anyhow::anyhow!("run ended early: {other:?}")),
+        CompletionReason::EndTurn => {}
+        other => return Err(anyhow::anyhow!("run ended early: {other:?}")),
     }
+
+    if let Some(report) = &verification {
+        if let Some(failure) = verification_failure(report) {
+            anyhow::bail!(failure);
+        }
+    }
+    Ok(())
 }
 
 fn to_anyhow(err: HarnessError) -> anyhow::Error {
@@ -384,6 +402,7 @@ fn summarize(
     agent_id: &str,
     model: &str,
     session_id: SessionId,
+    verification: Option<&VerificationReport>,
 ) {
     if !outcome.final_text.is_empty() {
         println!();
@@ -394,7 +413,109 @@ fn summarize(
         outcome.turns,
         outcome.usage.total()
     );
+    // Stated on every run: "the build exited 0" is evidence that output was
+    // produced, never that the result was checked, and the summary must not let
+    // the two read the same.
+    eprintln!("-- verification: {}", verification_line(verification));
     eprintln!("-- session {session_id} (see `harness memory tree`)");
+}
+
+/// The one line the summary prints about verification.
+fn verification_line(report: Option<&VerificationReport>) -> &'static str {
+    match report {
+        Some(report) if report.valid => "verified",
+        Some(report) if report.checked => "failed",
+        _ => "not verified (no check ran)",
+    }
+}
+
+/// Runs the configured checks over the workspace the run left behind.
+///
+/// Returns `None` when nothing is configured: verification is opt-in, and a run
+/// that asked for none is reported as unverified rather than as verified.
+async fn verify_run(
+    command: &RunCommand,
+    ctx: &AppContext,
+    provider: &Arc<dyn Provider>,
+    prompt: &str,
+    outcome: &harness_agent::RunOutcome,
+) -> anyhow::Result<Option<VerificationReport>> {
+    let checks = resolve_verify_checks(&command.verify, &ctx.config.verify.checks);
+    if checks.is_empty() && !ctx.config.verify.adversarial {
+        return Ok(None);
+    }
+
+    let verifier = build_verifier(&ctx.config, Arc::clone(provider), checks.clone());
+    // `run` has no task DAG: the whole prompt is the one unit of work, so it is
+    // both the objective the reviewer reads and the node the checks belong to.
+    let node = TaskNode {
+        id: "run".to_string(),
+        objective: prompt.to_string(),
+        agent: None,
+        depends_on: Vec::new(),
+        files: Vec::new(),
+        verify: checks,
+    };
+    let result = SubtaskResult {
+        objective: prompt.to_string(),
+        state: format!("the run ended: {:?}", outcome.reason),
+        evidence: outcome.final_text.clone(),
+        boundary: "the checks run against the workspace, not the run's transcript".to_string(),
+    };
+
+    let report = verifier
+        .verify(&node, &result, &ctx.workspace_root)
+        .await
+        .map_err(to_anyhow)?;
+    print_verification(&report);
+    Ok(Some(report))
+}
+
+/// Prints what ran and what it found, so the exit code is never the only signal.
+fn print_verification(report: &VerificationReport) {
+    for check in &report.checks {
+        let verdict = if check.passed { "passed" } else { "failed" };
+        eprintln!("-- check `{}`: {verdict} ({})", check.name, check.detail);
+    }
+    for issue in &report.issues {
+        eprintln!(
+            "-- [{}] {}: {}",
+            severity_label(issue.severity),
+            issue.summary,
+            first_line(&issue.evidence)
+        );
+    }
+}
+
+/// The reason a verification should make the command exit non-zero, or `None`
+/// when it passed.
+///
+/// Separated from the run so the exit-code decision can be tested without a
+/// model. An unchecked report is not a failure: there is nothing to fail on, and
+/// the summary already says that nothing ran.
+fn verification_failure(report: &VerificationReport) -> Option<String> {
+    if report.valid || !report.checked {
+        return None;
+    }
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|check| !check.passed)
+        .map(|check| check.name.as_str())
+        .collect();
+    Some(if failed.is_empty() {
+        "verification failed".to_string()
+    } else {
+        format!("verification failed: {}", failed.join(", "))
+    })
+}
+
+fn severity_label(severity: harness_orchestrator::Severity) -> &'static str {
+    match severity {
+        harness_orchestrator::Severity::Info => "info",
+        harness_orchestrator::Severity::Warning => "warning",
+        harness_orchestrator::Severity::Error => "error",
+    }
 }
 
 fn first_line(text: &str) -> String {
@@ -419,6 +540,7 @@ fn tint(text: &str, code: &str, enabled: bool) -> String {
 mod tests {
     use super::*;
     use harness_guardrails::GuardContext;
+    use harness_orchestrator::CheckOutcome;
 
     fn config(enabled: bool, max_identical_tool_calls: usize) -> GuardrailsConfig {
         GuardrailsConfig {
@@ -464,6 +586,71 @@ mod tests {
         assert_eq!(
             third.blocked.map(|report| report.name),
             Some("behavior_monitor".to_string())
+        );
+    }
+
+    fn report(valid: bool, checked: bool, checks: Vec<CheckOutcome>) -> VerificationReport {
+        VerificationReport {
+            valid,
+            checked,
+            checks,
+            issues: Vec::new(),
+        }
+    }
+
+    fn check(name: &str, passed: bool) -> CheckOutcome {
+        CheckOutcome {
+            name: name.to_string(),
+            passed,
+            detail: "exit 0".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_passing_verification_is_not_a_failure() {
+        let report = report(true, true, vec![check("cargo test", true)]);
+        assert!(verification_failure(&report).is_none());
+    }
+
+    #[test]
+    fn a_failing_check_makes_the_run_fail_and_names_the_check() {
+        let report = report(false, true, vec![check("cargo test", false)]);
+        let failure = verification_failure(&report).expect("a failure");
+        assert!(failure.contains("cargo test"), "{failure}");
+    }
+
+    #[test]
+    fn an_unchecked_report_is_not_a_failure() {
+        // Nothing ran, so there is nothing to fail on; the summary is what says
+        // the run was not verified.
+        let report = report(false, false, Vec::new());
+        assert!(verification_failure(&report).is_none());
+    }
+
+    #[test]
+    fn the_summary_never_calls_an_unchecked_run_verified() {
+        assert_eq!(verification_line(None), "not verified (no check ran)");
+        assert_eq!(
+            verification_line(Some(&report(false, false, Vec::new()))),
+            "not verified (no check ran)"
+        );
+        assert_eq!(
+            verification_line(Some(&report(true, true, vec![check("cargo test", true)]))),
+            "verified"
+        );
+        assert_eq!(
+            verification_line(Some(&report(false, true, vec![check("cargo test", false)]))),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn verify_checks_fall_back_to_the_configured_ones() {
+        let configured = vec![vec!["cargo".to_string(), "test".to_string()]];
+        assert_eq!(resolve_verify_checks(&[], &configured), configured);
+        assert_eq!(
+            resolve_verify_checks(&["git --version".to_string()], &configured),
+            vec![vec!["git".to_string(), "--version".to_string()]]
         );
     }
 }

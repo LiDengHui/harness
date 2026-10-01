@@ -2,16 +2,18 @@
 //!
 //! Two independent signals are combined. The deterministic one runs configured
 //! commands in the node's worktree and parses their output into structured
-//! diagnostics; the adversarial one asks a *separate* model instance to look for
-//! what the first signal cannot see. The separate instance is the point: a
-//! reviewer sharing the executor's provider and conversation would mostly
-//! confirm what the executor already believed.
+//! diagnostics; the adversarial one asks a model to look for what the first
+//! signal cannot see, in a fresh tool-free request that never sees the worker's
+//! conversation. That separation is the point: a reviewer sharing the executor's
+//! conversation would mostly confirm what the executor already believed.
 //!
-//! `valid` is the conjunction of the two. The commands come from the node when
-//! it declares any — a workflow stage's `verify` is the contract for that stage
-//! — and from [`VerifierConfig::checks`] otherwise. An empty command list is
-//! vacuously true but is never silent: the report carries a warning saying that
-//! nothing was checked, so "no failure" is not mistaken for "verified".
+//! `valid` is true only when at least one of the two signals ran and neither
+//! objected; `checked` records whether any ran at all. A report with neither
+//! checks nor an adversary is `valid == false, checked == false` — nothing was
+//! checked, which is a different claim from "checked and passed" and must not be
+//! read as one. The commands come from the node when it declares any — a
+//! workflow stage's `verify` is the contract for that stage — and from
+//! [`VerifierConfig::checks`] otherwise.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -56,7 +58,14 @@ pub struct CheckOutcome {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerificationReport {
+    /// True only when something ran and nothing failed. It is never true for a
+    /// report that checked nothing: an empty check list is not a pass.
     pub valid: bool,
+    /// True when a deterministic check or the adversarial reviewer actually
+    /// ran. `valid == false, checked == false` means "nothing was checked",
+    /// where `valid == false, checked == true` means "checked and failed".
+    #[serde(default)]
+    pub checked: bool,
     pub checks: Vec<CheckOutcome>,
     pub issues: Vec<Issue>,
 }
@@ -65,7 +74,9 @@ pub struct VerifierConfig {
     /// Commands run in the worktree, e.g. ["cargo", "check"].
     pub checks: Vec<Vec<String>>,
     pub timeout: Duration,
-    /// A model instance independent of the executor's, for adversarial review.
+    /// A provider for the adversarial review. Ideally one independent of the
+    /// executor's; the CLI wires the run's own, where the separation is the
+    /// fresh tool-free request rather than a different model.
     pub adversarial_provider: Option<Arc<dyn Provider>>,
     pub adversarial_model: Option<String>,
 }
@@ -128,8 +139,10 @@ impl Verifier {
         }
 
         let mut adversarial_valid = true;
+        let mut adversarial_ran = false;
         match &self.config.adversarial_provider {
             Some(provider) => {
+                adversarial_ran = true;
                 let model = self
                     .config
                     .adversarial_model
@@ -147,9 +160,13 @@ impl Verifier {
             }),
         }
 
+        // A check that could not start still counts as run: it produced a
+        // verdict, and that verdict was failure.
+        let checked = !checks.is_empty() || adversarial_ran;
         let checks_ok = checks.iter().all(|check| check.passed);
         Ok(VerificationReport {
-            valid: checks_ok && adversarial_valid,
+            valid: checked && checks_ok && adversarial_valid,
+            checked,
             checks,
             issues,
         })
@@ -559,6 +576,7 @@ mod tests {
         assert_eq!(report.checks[0].name, "git --version");
         assert!(report.checks[0].passed);
         assert!(report.valid);
+        assert!(report.checked);
     }
 
     #[tokio::test]
@@ -579,6 +597,7 @@ mod tests {
             .unwrap();
 
         assert!(!report.valid, "{:?}", report.checks);
+        assert!(report.checked);
         assert!(!report.checks[0].passed);
     }
 
@@ -591,7 +610,13 @@ mod tests {
             .unwrap();
 
         assert!(report.checks.is_empty());
-        assert!(report.valid, "nothing failed, but the report says so");
+        // Nothing failed because nothing ran. The report must not present that
+        // as a pass: `checked` is what tells the two apart.
+        assert!(
+            !report.valid,
+            "nothing was checked, so nothing was verified"
+        );
+        assert!(!report.checked);
         assert!(
             report
                 .issues
@@ -621,6 +646,7 @@ mod tests {
         assert_eq!(report.checks.len(), 1);
         assert!(report.checks[0].passed);
         assert!(report.valid);
+        assert!(report.checked);
     }
 
     #[tokio::test]
@@ -642,6 +668,7 @@ mod tests {
             .unwrap();
 
         assert!(!report.valid);
+        assert!(report.checked);
         assert!(!report.checks[0].passed);
         assert!(report
             .issues
@@ -661,6 +688,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!report.valid);
+        assert!(report.checked);
         assert!(!report.checks[0].passed);
     }
 
@@ -692,6 +720,7 @@ mod tests {
             .unwrap();
 
         assert!(!report.valid);
+        assert!(report.checked);
         assert!(report.checks[0].detail.contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(4));
     }
@@ -714,6 +743,7 @@ mod tests {
             .unwrap();
 
         assert!(!report.valid);
+        assert!(report.checked);
         assert!(report
             .issues
             .iter()
@@ -739,6 +769,7 @@ mod tests {
             .await
             .unwrap();
         assert!(report.valid);
+        assert!(report.checked);
 
         let requests = scripted.requests();
         assert_eq!(requests.len(), 1);
@@ -768,6 +799,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!report.valid);
+        assert!(report.checked);
         assert!(report
             .issues
             .iter()
@@ -790,6 +822,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scripted.requests()[0].model, "scripted-1");
+    }
+
+    #[tokio::test]
+    async fn the_three_verification_states_are_distinct() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+
+        let nothing = verifier(VerifierConfig::default())
+            .verify(&node(), &result(), tmp.path())
+            .await
+            .unwrap();
+        let passing = verifier(VerifierConfig {
+            checks: vec![vec!["git".into(), "--version".into()]],
+            ..VerifierConfig::default()
+        })
+        .verify(&node(), &result(), tmp.path())
+        .await
+        .unwrap();
+        let failing = verifier(VerifierConfig {
+            checks: vec![vec![
+                "git".into(),
+                "rev-parse".into(),
+                "--verify".into(),
+                "--quiet".into(),
+                "HEAD".into(),
+            ]],
+            ..VerifierConfig::default()
+        })
+        .verify(&node(), &result(), tmp.path())
+        .await
+        .unwrap();
+
+        // (valid, checked): nothing ran, ran and passed, ran and failed.
+        assert_eq!((nothing.valid, nothing.checked), (false, false));
+        assert_eq!((passing.valid, passing.checked), (true, true));
+        assert_eq!((failing.valid, failing.checked), (false, true));
     }
 
     #[test]

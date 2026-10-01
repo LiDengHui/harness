@@ -1,4 +1,10 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use clap::Subcommand;
+use harness_core::Config;
+use harness_llm::Provider;
+use harness_orchestrator::{Verifier, VerifierConfig};
 
 use crate::context::AppContext;
 
@@ -79,6 +85,11 @@ pub struct RunCommand {
     /// Emit the raw `AgentEvent` stream as JSON lines instead of pretty output.
     #[arg(long)]
     pub json_events: bool,
+    /// Command that decides whether the run's result is acceptable, e.g.
+    /// `--verify "cargo test"`. Repeatable; each value is split on whitespace
+    /// into program and arguments. Outranks `[verify] checks`.
+    #[arg(long, value_name = "CMD")]
+    pub verify: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -99,6 +110,11 @@ pub struct PlanCommand {
     /// Maximum number of Reflexion retries per sub-task.
     #[arg(long, default_value_t = 2)]
     pub max_retries: u32,
+    /// Command that decides whether a node's result is acceptable, e.g.
+    /// `--verify "cargo test"`. Repeatable; each value is split on whitespace
+    /// into program and arguments. Outranks `[verify] checks`.
+    #[arg(long, value_name = "CMD")]
+    pub verify: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -316,4 +332,46 @@ fn paths(ctx: &AppContext) -> anyhow::Result<()> {
     }
     println!("database:  {}", ctx.db_path().display());
     Ok(())
+}
+
+/// The checks a run verifies with: the ones given on the command line when there
+/// are any, otherwise the `[verify]` section.
+///
+/// The flag wins because it is the narrower, more deliberate statement — typed
+/// for this invocation rather than left in a file — and a run that says what to
+/// check should not have that quietly widened by a config it never read.
+pub(crate) fn resolve_verify_checks(
+    from_flag: &[String],
+    configured: &[Vec<String>],
+) -> Vec<Vec<String>> {
+    if from_flag.is_empty() {
+        return configured.to_vec();
+    }
+    from_flag
+        .iter()
+        .map(|command| {
+            command
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .collect()
+}
+
+/// The verifier both `run` and `plan` build from the `[verify]` section.
+///
+/// The adversarial reviewer is the run's own provider rather than a second one:
+/// what makes the review independent is that it is a fresh, tool-free request
+/// that never sees the worker's conversation, not that it is a different model.
+pub(crate) fn build_verifier(
+    config: &Config,
+    provider: Arc<dyn Provider>,
+    checks: Vec<Vec<String>>,
+) -> Verifier {
+    Verifier::new(VerifierConfig {
+        checks,
+        timeout: Duration::from_secs(config.verify.timeout_secs),
+        adversarial_provider: config.verify.adversarial.then(|| Arc::clone(&provider)),
+        adversarial_model: None,
+    })
 }

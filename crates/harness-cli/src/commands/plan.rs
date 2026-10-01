@@ -21,10 +21,11 @@ use harness_llm::Provider;
 use harness_memory::SqliteMemory;
 use harness_orchestrator::{
     ExecutionReport, Executor, ExecutorConfig, NodeOutcome, Planner, Severity, TaskGraph, TaskNode,
+    VerificationReport,
 };
 use tokio::sync::mpsc;
 
-use crate::commands::PlanCommand;
+use crate::commands::{build_verifier, resolve_verify_checks, PlanCommand};
 use crate::context::AppContext;
 
 /// Used only when a workspace has no `.agent.md` files at all.
@@ -73,7 +74,20 @@ pub(crate) async fn execute(command: PlanCommand, ctx: &AppContext) -> anyhow::R
     eprintln!("-- planning with {planner_provider_id}/{planner_model}");
 
     let planner = Planner::new(planner_provider, planner_model, MAX_PLAN_NODES);
-    let graph = planner.plan(&command.task, None).await.map_err(to_anyhow)?;
+    let mut graph = planner.plan(&command.task, None).await.map_err(to_anyhow)?;
+
+    // `--verify` is this run's contract for every node that does not declare its
+    // own: a planner-produced node carries no checks, and writing them onto the
+    // node is what makes the gate visible in the plan rather than only at the
+    // executor's default. A workflow stage that declares its own still wins.
+    let verify_checks = resolve_verify_checks(&command.verify, &ctx.config.verify.checks);
+    if !verify_checks.is_empty() {
+        for node in graph.nodes.iter_mut() {
+            if node.verify.is_empty() {
+                node.verify = verify_checks.clone();
+            }
+        }
+    }
 
     // Layering validates first, so a graph that fails is refused here rather
     // than discovered node by node with tokens already spent.
@@ -98,6 +112,14 @@ pub(crate) async fn execute(command: PlanCommand, ctx: &AppContext) -> anyhow::R
         .map_err(to_anyhow)?;
     eprintln!("-- session {session_id} (see `harness memory tree`)");
 
+    // The executor's verifier covers the nodes that declare no check of their
+    // own. `--verify` has already been written onto those nodes above, so this
+    // is where the `[verify]` section and the adversarial reviewer are wired in.
+    let verifier = build_verifier(
+        &ctx.config,
+        Arc::clone(&provider),
+        ctx.config.verify.checks.clone(),
+    );
     let executor = Executor::new(
         ExecutorConfig {
             max_retries: command.max_retries,
@@ -110,7 +132,8 @@ pub(crate) async fn execute(command: PlanCommand, ctx: &AppContext) -> anyhow::R
         provider,
         memory,
         ctx.workspace_root.clone(),
-    );
+    )
+    .with_verifier(verifier);
 
     let (events, mut receiver) = mpsc::unbounded_channel::<RoutedEvent>();
     let printer = tokio::spawn(async move { print_events(&mut receiver).await });
@@ -312,15 +335,23 @@ fn print_plan(graph: &TaskGraph, layers: &[Vec<&TaskNode>]) {
     }
 }
 
+/// What the report says about one node's verification, in the three states that
+/// matter: nothing ran, ran and passed, ran and failed. A node the executor
+/// never reached has no report at all, which is plainly unverified.
+fn verification_label(verification: Option<&VerificationReport>) -> &'static str {
+    match verification {
+        Some(report) if report.valid => "verified",
+        Some(report) if report.checked => "verification failed",
+        Some(_) => "not verified (no check ran)",
+        None => "not verified",
+    }
+}
+
 fn print_report(report: &ExecutionReport) {
     println!();
     println!("report:");
     for outcome in &report.nodes {
-        let verification = match &outcome.verification {
-            Some(report) if report.valid => "verified",
-            Some(_) => "verification failed",
-            None => "not verified",
-        };
+        let verification = verification_label(outcome.verification.as_ref());
         println!(
             "  {:<22} {:<10} attempts={} tokens={} {verification}",
             outcome.id,
@@ -560,5 +591,33 @@ fn tint(text: &str, code: &str, enabled: bool) -> String {
         format!("\u{1b}[{code}m{text}\u{1b}[0m")
     } else {
         text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(valid: bool, checked: bool) -> VerificationReport {
+        VerificationReport {
+            valid,
+            checked,
+            checks: Vec::new(),
+            issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_three_verification_states_read_differently() {
+        assert_eq!(verification_label(None), "not verified");
+        assert_eq!(
+            verification_label(Some(&report(false, false))),
+            "not verified (no check ran)"
+        );
+        assert_eq!(verification_label(Some(&report(true, true))), "verified");
+        assert_eq!(
+            verification_label(Some(&report(false, true))),
+            "verification failed"
+        );
     }
 }

@@ -32,6 +32,7 @@ pub struct Config {
     pub thinking: ThinkingConfig,
     pub context: ContextConfig,
     pub ui: UiConfig,
+    pub verify: VerifyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +465,33 @@ impl Default for GuardrailsConfig {
     }
 }
 
+/// Whether a run's result is checked before the run reports success.
+///
+/// Empty by default: verification is opt-in, so a run that configures nothing is
+/// reported as unverified rather than as a success that was never checked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    /// Shell-free commands run in the workspace after a run, e.g.
+    /// `[["cargo", "test"]]`. An empty list with `adversarial = false` means
+    /// nothing is checked.
+    pub checks: Vec<Vec<String>>,
+    /// How long one check may run before it is killed and counted as failed.
+    pub timeout_secs: u64,
+    /// Ask the run's own model to review the result adversarially.
+    pub adversarial: bool,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            checks: Vec::new(),
+            timeout_secs: 120,
+            adversarial: false,
+        }
+    }
+}
+
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|text| !text.is_empty())
 }
@@ -865,6 +893,38 @@ max_identical_tool_calls = 5
         let partial: Config = toml::from_str("[guardrails]\nenabled = false\n").unwrap();
         assert!(!partial.guardrails.enabled);
         assert_eq!(partial.guardrails.max_identical_tool_calls, 3);
+    }
+
+    #[test]
+    fn verify_settings_parse_and_fall_back_to_defaults() {
+        let parsed: Config = toml::from_str(
+            r#"
+[verify]
+checks = [["cargo", "test"]]
+timeout_secs = 30
+adversarial = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.verify.checks,
+            vec![vec!["cargo".to_string(), "test".to_string()]]
+        );
+        assert_eq!(parsed.verify.timeout_secs, 30);
+        assert!(parsed.verify.adversarial);
+
+        // Nothing configured means nothing is checked: verification is opt-in.
+        let bare = Config::default();
+        assert!(bare.verify.checks.is_empty());
+        assert!(!bare.verify.adversarial);
+        assert_eq!(bare.verify.timeout_secs, 120);
+
+        // A partial section fills the rest from the default.
+        let partial: Config =
+            toml::from_str("[verify]\nchecks = [[\"git\", \"--version\"]]\n").unwrap();
+        assert_eq!(partial.verify.checks.len(), 1);
+        assert_eq!(partial.verify.timeout_secs, 120);
+        assert!(!partial.verify.adversarial);
     }
 
     #[test]
