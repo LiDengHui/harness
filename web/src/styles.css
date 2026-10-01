@@ -1,0 +1,386 @@
+/*
+ * A dense dark theme for a developer tool: system fonts only (nothing is
+ * fetched at runtime, which is what makes the bundle work offline), one palette
+ * in custom properties, and no framework.
+ */
+
+:root {
+  --bg: #14161a;
+  --panel: #191c21;
+  --panel-2: #20242b;
+  --code: #101216;
+  --border: #2a2f38;
+  --fg: #dfe3ea;
+  --muted: #8792a2;
+  --accent: #4b9ddd;
+  --lane: #8a6fd0;
+  --ok: #4caf7d;
+  --warn: #d9a23b;
+  --error: #d9534f;
+  --cap-bg: rgba(217, 163, 59, 0.12);
+  --cap-fg: #d9a23b;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  /*
+   * The Latin faces come first so Latin text keeps its metrics, then the CJK
+   * faces the Chinese locale needs — without them a Chinese glyph falls back to
+   * whatever the OS picks, which on Windows is a heavier, differently-spaced
+   * face than the rest of the page.
+   */
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 0.82em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.pad {
+  padding: 0.75rem 1rem;
+}
+
+.error-text {
+  color: var(--error);
+}
+
+.btn {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.28rem 0.7rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-small {
+  font-size: 0.74rem;
+  padding: 0.16rem 0.5rem;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1016;
+  font-weight: 600;
+}
+
+.btn-danger {
+  background: transparent;
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.input {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--code);
+  color: var(--fg);
+}
+
+.input:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
+.input:disabled {
+  opacity: 0.5;
+}
+
+.tag {
+  display: inline-block;
+  font-size: 0.72rem;
+  padding: 0.05rem 0.4rem;
+  margin: 0 0.2rem 0.15rem 0;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.tag-ok,
+.tag-succeeded {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.tag-warn,
+.tag-running,
+.tag-skipped {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.tag-error,
+.tag-failed {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.tag-lane {
+  color: var(--lane);
+  border-color: var(--lane);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.table th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.table tbody tr:hover {
+  background: var(--panel);
+}
+
+.table tbody tr.selected {
+  background: var(--panel-2);
+}
+
+.table .num {
+  text-align: right;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 8rem 1fr;
+  gap: 0.2rem 0.75rem;
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2f3641;
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ==========================================================================
+   Responsive foundation
+   ==========================================================================
+
+   The breakpoint contract, published here for every agent to consume:
+
+     phone     width <= 640px
+     tablet    641px .. 1024px
+     desktop   width > 1024px
+
+   `src/composables/useViewport.ts` exports the same two numbers
+   (`PHONE_MAX_WIDTH = 640`, `TABLET_MAX_WIDTH = 1024`), so the JS and the CSS
+   cannot drift. A custom property cannot be read from inside a media query, so
+   the `--bp-*` values below are the documented copy of the contract and the
+   source for anything that needs the number in a calculation; the media queries
+   themselves spell the numbers out and must be kept in step by hand.
+
+   Nothing in this section changes the desktop rendering: every rule that
+   restyles an existing element lives inside `@media (max-width: 640px)`, and
+   the unconditional rules only harden the box model and overflow behaviour that
+   desktop already satisfied.
+
+   THE LAYOUT CONTRACT
+
+   `--tabbar-height` is `0px` on tablet and desktop, and on a phone it is the
+   height of the bottom tab bar the shell renders: `56px` of bar plus the bottom
+   safe-area inset. A surface that scrolls to the bottom of the screen pads
+   itself with `padding-bottom: var(--tabbar-height)` (or, for a scroll
+   container, `scroll-padding-bottom`) so its last row is never hidden behind
+   the bar. The bar itself is fixed, `height: var(--tabbar-content-height)`,
+   anchored with `bottom: 0` and padded by `--safe-bottom`; that is the shell
+   agent's half of the contract and the 56px is not negotiable.
+   ========================================================================== */
+
+:root {
+  /* The breakpoint contract, as documented above. */
+  --bp-phone-max: 640px;
+  --bp-tablet-min: 641px;
+  --bp-tablet-max: 1024px;
+  --bp-desktop-min: 1025px;
+
+  /* Safe-area insets, 0 on everything without a notch. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+
+  /* Height of the bottom tab bar's content, before the safe-area inset. */
+  --tabbar-content-height: 56px;
+  /* Space the tab bar occupies. 0 wherever the shell does not show it. */
+  --tabbar-height: 0px;
+
+  /* Minimum hit area for a control on a phone, in both axes. */
+  --touch-target: 44px;
+}
+
+@media (max-width: 640px) {
+  :root {
+    --tabbar-height: calc(var(--tabbar-content-height) + var(--safe-bottom));
+  }
+}
+
+/*
+ * The box model, applied to the pseudo-elements too. `*` already set this for
+ * real elements; no rule in the app sizes a `::before`/`::after`, so extending
+ * it there is a no-op today and one less surprise tomorrow.
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* A phone that rotates must not re-flow its own font size. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /*
+   * No page-level sideways scroll, ever. On the root element the overflow
+   * propagates to the viewport, so this cannot become a containing block for a
+   * `position: fixed` child.
+   */
+  overflow-x: hidden;
+}
+
+body {
+  /*
+   * `clip` rather than `hidden`: `hidden` would make <body> a scroll container,
+   * which breaks `position: sticky` inside it and lets a scrollbar appear next
+   * to a fixed tab bar. `clip` only trims the overflow.
+   */
+  overflow-x: clip;
+  /* An app shell should not rubber-band or pull-to-refresh. */
+  overscroll-behavior-y: none;
+}
+
+/*
+ * Long unbroken strings are this app's most likely phone breakage: it renders
+ * ULIDs, absolute file paths and raw JSON, any of which is wider than a 360px
+ * screen. `.wrap-anywhere` is the opt-in utility for a surface that needs it at
+ * every width; the phone block below applies the same rules to the elements
+ * that are monospace by nature.
+ */
+.wrap-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
+@media (max-width: 640px) {
+  /*
+   * Ids, paths and JSON wrap instead of pushing the layout wide. The desktop
+   * rule for `.mono` is left alone, so this changes nothing above 640px.
+   */
+  .mono,
+  code,
+  kbd,
+  pre,
+  samp {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  /*
+   * A finger is not a mouse: every control gets a 44px hit area. The shared
+   * controls in this file are covered here so an agent does not have to add the
+   * class to each one; `.touch-target` is the same guarantee for anything else,
+   * including an icon-only button that also needs the width.
+   */
+  .btn,
+  .input,
+  .touch-target {
+    min-height: var(--touch-target);
+  }
+
+  .touch-target {
+    min-width: var(--touch-target);
+  }
+
+  /* A control that must stay inline (a tag, a chip) keeps its height but gets
+   * the width it needs to be tappable. */
+  .touch-target-inline {
+    min-width: var(--touch-target);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}

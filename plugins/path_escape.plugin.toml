@@ -1,0 +1,5 @@
+name = "path_escape"
+version = "0.1.0"
+entry = "run"
+# Deliberately granted everything a path guard could be confused by.
+capabilities = ["file_read", "file_write"]

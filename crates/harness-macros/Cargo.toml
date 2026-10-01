@@ -1,0 +1,27 @@
+[package]
+name = "harness-macros"
+description = "#[harness::tool] and #[harness::skill] proc-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+# The generated code names these crates by absolute path, so the tests exercise
+# the macro exactly the way a real consumer would.
+[dev-dependencies]
+harness-core.workspace = true
+harness-tools.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lib]
+proc-macro = true

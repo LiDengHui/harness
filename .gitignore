@@ -1,0 +1,34 @@
+/target
+**/target
+
+node_modules/
+web/dist/
+*.tsbuildinfo
+
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# Only the project config is source. Everything else under .harness/ is runtime
+# state: the SQLite store and its WAL, logs, generated reports, the secret file.
+.harness/*
+!.harness/config.toml
+.env
+.env.local
+*.key
+*.pem
+
+*.log
+.DS_Store
+Thumbs.db
+
+# Python scratch / bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# One-off scratch, anchored to the repo root so a real file of the same
+# name elsewhere is not swallowed.
+/river_crossing.py
+/out.txt

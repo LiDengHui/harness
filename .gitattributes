@@ -1,0 +1,18 @@
+# Normalise line endings in the repository; check out native on Windows.
+* text=auto eol=lf
+
+# Keep these byte-exact.
+*.wat   -text
+*.wasm  binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+
+# Windows launchers must stay CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Lockfiles and vendored files are noise in diffs and review.
+Cargo.lock     -diff linguist-generated
+pnpm-lock.yaml -diff linguist-generated

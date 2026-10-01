@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "A local-first agent harness: Rust kernel, WebSocket bus, declarative agent capabilities."
+repository = "https://github.com/LiDengHui/dhl-harness"
+
+[workspace.dependencies]
+# ---- internal crates ----
+harness-core = { path = "crates/harness-core" }
+harness-llm = { path = "crates/harness-llm" }
+harness-tools = { path = "crates/harness-tools" }
+harness-memory = { path = "crates/harness-memory" }
+harness-agent = { path = "crates/harness-agent" }
+harness-skills = { path = "crates/harness-skills" }
+harness-macros = { path = "crates/harness-macros" }
+harness-mcp = { path = "crates/harness-mcp" }
+harness-sandbox = { path = "crates/harness-sandbox" }
+harness-guardrails = { path = "crates/harness-guardrails" }
+harness-orchestrator = { path = "crates/harness-orchestrator" }
+harness-workflows = { path = "crates/harness-workflows" }
+harness-server = { path = "crates/harness-server" }
+harness-cli = { path = "crates/harness-cli" }
+
+# ---- async runtime ----
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# ---- serialization ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+serde_norway = "0.9"
+
+# ---- error handling ----
+thiserror = "2"
+anyhow = "1"
+
+# ---- ids / time ----
+ulid = { version = "3", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ---- secrets ----
+getrandom = "0.3"
+
+# ---- observability ----
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- fs / pattern ----
+globset = "0.4"
+walkdir = "2.5"
+tempfile = "3"
+regex = "1"
+
+# ---- http / ws ----
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "default-tls"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "fs"] }
+tokio-tungstenite = "0.30"
+
+# ---- storage ----
+rusqlite = { version = "0.37", features = ["bundled", "blob", "functions", "serde_json"] }
+
+# ---- extensions ----
+wasmtime = "49"
+wasmtime-wasi = "49"
+ed25519-dalek = "3"
+sha2 = "0.11"
+base64 = "0.23"
+
+# ---- concurrency / cache ----
+parking_lot = "0.12"
+dashmap = "6"
+lru = "0.18"
+
+# ---- cli ----
+clap = { version = "4", features = ["derive", "env"] }
+
+# ---- frontend embedding ----
+rust-embed = "8"
+
+# ---- proc-macro ----
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Tool-heavy integration tests spend most of their time in dependency code.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,6 @@
+name = "logger"
+version = "0.1.0"
+entry = "run"
+# `harness.log` is unconditional, so the list can stay empty even though this
+# plugin does call into the host.
+capabilities = []

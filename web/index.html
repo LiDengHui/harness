@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      `viewport-fit=cover` is what makes `env(safe-area-inset-*)` report real
+      values on a notched phone; without it the insets are always 0 and the
+      bottom tab bar would sit under the home indicator.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <!-- Matches `--bg`, so the phone's own chrome blends into the page. -->
+    <meta name="theme-color" content="#14161a" />
+    <title>harness</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23191c21'/><text x='16' y='23' font-family='monospace' font-size='19' font-weight='bold' fill='%234b9ddd' text-anchor='middle'>h</text></svg>"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #14161a;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

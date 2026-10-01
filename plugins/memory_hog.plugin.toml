@@ -1,0 +1,4 @@
+name = "memory_hog"
+version = "0.1.0"
+entry = "run"
+capabilities = []

@@ -1,0 +1,22 @@
+[package]
+name = "harness-workflows"
+description = "Named, reusable workflow procedures: stage graphs a task can be run through"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core.workspace = true
+harness-llm.workspace = true
+harness-orchestrator.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "harness-sandbox"
+description = "wasmtime plugin sandbox with host-enforced capability grants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The plugin ABI is WASI-free on purpose: the only imports a plugin can reach are
+# the `harness.*` functions this crate defines, so there is no ambient
+# filesystem/clock/random authority to reason about. That is why `wasmtime-wasi`
+# is deliberately absent.
+[dependencies]
+harness-core.workspace = true
+wasmtime.workspace = true
+serde.workspace = true
+toml.workspace = true
+reqwest.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

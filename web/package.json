@@ -1,0 +1,30 @@
+{
+  "name": "harness-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser front end for the harness agent server: live transcript, agents and extensions.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "katex": "0.18.10",
+    "mermaid": "12.0.0",
+    "pinia": "4.0.3",
+    "vue": "3.5.43",
+    "vue-i18n": "11.4.12",
+    "vue-router": "5.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.9",
+    "typescript": "6.0.3",
+    "vite": "8.3.1",
+    "vitest": "5.0.2",
+    "vue-tsc": "3.3.11"
+  }
+}

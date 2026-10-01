@@ -1,0 +1,22 @@
+[package]
+name = "harness-core"
+description = "Harness core: ids, config, errors, events, token estimation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

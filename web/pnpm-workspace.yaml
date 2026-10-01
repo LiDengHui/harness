@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - katex@0.18.10

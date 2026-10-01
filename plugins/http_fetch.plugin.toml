@@ -1,0 +1,4 @@
+name = "http_fetch"
+version = "0.1.0"
+entry = "run"
+capabilities = ["network_access"]

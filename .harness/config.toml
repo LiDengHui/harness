@@ -1,0 +1,103 @@
+# Project-level harness configuration.
+#
+# Layering: ~/.harness/config.toml  <-  ./.harness/config.toml  <-  --config FILE
+# Later layers win; tables merge key-wise rather than replacing wholesale.
+#
+# Secrets never live here. A provider names the environment variable that holds
+# its key, and the key is read at call time.
+
+[harness]
+default_agent = "default"
+# Hard ceiling on ReAct turns per run. A multi-file investigation spends most of
+# its turns on exploration (list, grep, read) before it edits anything, and each
+# edit/verify cycle costs two more (edit, then run the suite); 32 truncates a
+# real investigation mid-flight, so the ceiling is 64.
+max_iterations = 64
+
+# Screen every conversation for credentials, PII, injected instructions and
+# destructive tool calls. On for this repository; a run that has it on says so.
+[guardrails]
+enabled = true
+max_identical_tool_calls = 3
+
+[provider]
+# `opencode-go` is the gateway this project runs on; `--provider mock` still
+# gives a keyless offline run, and `--provider deepseek|openai|moonshot|ollama`
+# switch to the other providers defined below.
+default = "opencode-go"
+request_timeout_secs = 180
+max_retries = 3
+
+[providers.mock]
+kind = "mock"
+default_model = "mock-1"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+default_model = "gpt-4o-mini"
+
+[providers.deepseek]
+kind = "openai"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-chat"
+
+[providers.moonshot]
+kind = "openai"
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "MOONSHOT_API_KEY"
+default_model = "kimi-k2-0905-preview"
+
+# Local endpoints may legitimately need no key at all.
+[providers.ollama]
+kind = "openai"
+base_url = "http://localhost:11434/v1"
+default_model = "qwen3-coder"
+
+# A gateway: it routes on an extra header, and spells the discriminator `type`
+# rather than `kind` (both are accepted).
+#
+# The API key is NOT here. Either export OPENCODE_GO_API_KEY, or drop
+# `api_key = "..."` into `.harness/secrets.toml`, which is gitignored.
+#
+# Models this endpoint serves that are worth knowing: `deepseek-v4.1-flash`
+# (the default below), `deepseek-v4-pro`, `kimi-k2.7-code`, `kimi-k3`,
+# `glm-5.3`, `qwen3.8-max`. `GET /v1/models` lists the current set.
+[providers.opencode-go]
+type = "openai"
+base_url = "https://opencode.ai/zen/go/v1"
+api_key_env = "OPENCODE_GO_API_KEY"
+default_model = "deepseek-v4.1-flash"
+
+# The gateway routes on an extra header. It is per-session, so it is not
+# committed; put yours in the user layer, `~/.harness/config.toml`, which
+# merges over this file:
+#
+#   [providers.opencode-go.custom_headers]
+#   X-Opencode-Session = "<your session id>"
+
+[tools]
+shell_timeout_secs = 120
+max_output_bytes = 65536
+max_read_bytes = 262144
+
+# `web_fetch` reaches the public web only. Turning this on lets it fetch
+# loopback, private, link-local and cloud-metadata addresses too, which is how a
+# prompt-injected instruction would read a local service or a cloud credential.
+web_fetch_allow_private_hosts = false
+
+# In-flight conversation trimming. The loop re-sends the whole conversation each
+# turn, so past this many characters of history it elides the oldest tool outputs
+# before building the next request. 0 disables trimming.
+[context]
+trim_threshold_chars = 200000
+
+[memory]
+db_path = ".harness/harness.db"
+embedding_dim = 256
+
+[server]
+host = "127.0.0.1"
+port = 8787
