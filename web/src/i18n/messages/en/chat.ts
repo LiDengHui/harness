@@ -58,6 +58,17 @@ export default {
       planTitle:
         'Have the agent break the task into steps and hand them to sub-agents',
       planHint: 'the agent returns a plan and delegates it, instead of doing the work here',
+      permission: {
+        label: 'permissions',
+        alwaysAsk: 'always ask',
+        askWhenNeeded: 'ask when needed',
+        fullAuto: 'fully automatic',
+        hint: {
+          alwaysAsk: 'ask before every tool call: nothing runs until you approve it',
+          askWhenNeeded: 'ask only when a call needs a permission the run does not have yet',
+          fullAuto: 'run every tool call without asking',
+        },
+      },
       agentDefault: 'agent: default',
       workflowLabel: 'workflow',
       workflowAuto: 'workflow: automatic',
@@ -79,6 +90,20 @@ export default {
       steer: 'add a note',
       steeringIdle: 'available only while a task is running',
       steeringSent: 'delivered to the running task: {text}',
+    },
+
+    /**
+     * The permission panel: a tool call stopped until the user decides. It is
+     * non-modal — the rail and the navigation stay usable — so the wording is a
+     * request rather than an alarm.
+     */
+    approval: {
+      heading: 'A tool needs your permission',
+      waiting: '{count} waiting',
+      tool: 'tool: {name}',
+      reason: 'stopped because: {reason}',
+      approve: 'approve',
+      deny: 'deny',
     },
 
     lane: {

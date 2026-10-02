@@ -36,6 +36,11 @@ pub struct ServeCommand {
     /// Provider id used as the session default.
     #[arg(long)]
     pub provider: Option<String>,
+    /// Permission tier used as the session default (`always_ask`,
+    /// `ask_when_needed` or `full_auto`). An agent file that declares its own
+    /// still wins.
+    #[arg(long)]
+    pub permission: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -56,6 +61,11 @@ pub struct WebCommand {
     /// An agent file that declares its own still wins.
     #[arg(long)]
     pub effort: Option<String>,
+    /// Permission tier used as the session default (`always_ask`,
+    /// `ask_when_needed` or `full_auto`). An agent file that declares its own
+    /// still wins.
+    #[arg(long)]
+    pub permission: Option<String>,
     /// Do not open a browser; just serve.
     #[arg(long)]
     pub no_open: bool,
@@ -79,6 +89,12 @@ pub struct RunCommand {
     /// agent's own declaration, which outranks the configured default.
     #[arg(long)]
     pub effort: Option<String>,
+    /// Permission tier for this run (`always_ask`, `ask_when_needed` or
+    /// `full_auto`). Outranks the agent's own declaration, which outranks the
+    /// configured default. A headless run defaults to `full_auto`, because
+    /// "ask when necessary" presupposes someone to ask.
+    #[arg(long)]
+    pub permission: Option<String>,
     /// Overrides the agent's `max_tokens` budget for this run.
     #[arg(long)]
     pub max_tokens: Option<u64>,

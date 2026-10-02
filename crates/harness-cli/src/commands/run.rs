@@ -16,8 +16,8 @@ use harness_agent::{
     AgentLoop, AgentRegistry, AgentRuntime, AgentSpec, MemoryRecorder, ModelRouter,
 };
 use harness_core::{
-    AgentEvent, CompletionReason, GuardrailsConfig, HarnessError, Memory, Message, SessionId,
-    ToolCallStatus,
+    AgentEvent, CompletionReason, GuardrailsConfig, HarnessError, Memory, Message, PermissionMode,
+    SessionId, ToolCallStatus,
 };
 use harness_guardrails::{
     BehaviorMonitor, ContentFence, GuardrailPipeline, PiiDetector, SecretScanner, ToolPolicy,
@@ -61,6 +61,16 @@ pub(crate) async fn execute(command: RunCommand, ctx: &AppContext) -> anyhow::Re
         })?),
         None => None,
     };
+    // Same treatment for the permission tier: a flag that names one the harness
+    // does not know is refused here rather than silently ignored.
+    let requested_permission = match command.permission.as_deref() {
+        Some(raw) => Some(PermissionMode::parse(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported --permission `{raw}`; supported: always_ask, ask_when_needed, full_auto"
+            )
+        })?),
+        None => None,
+    };
     let resolved = router
         .resolve(Some(spec.as_ref()), None, &overrides)
         .map_err(to_anyhow)?;
@@ -94,6 +104,20 @@ pub(crate) async fn execute(command: RunCommand, ctx: &AppContext) -> anyhow::Re
         .resolve(requested_effort, agent_config.reasoning_effort.as_deref())
         .to_string();
     agent_config.reasoning_effort = Some(effort);
+    // Permission precedence, highest first: the flag, the agent's declaration,
+    // the configured default, then full auto. The last tier is the headless
+    // default, because `dhs run` has nobody to ask and a gate would otherwise
+    // wait out the timeout for an answer that cannot come.
+    let permission = requested_permission
+        .or_else(|| {
+            spec.permission_mode
+                .as_deref()
+                .and_then(PermissionMode::parse)
+        })
+        .or(ctx.config.permissions.mode)
+        .unwrap_or(PermissionMode::FullAuto);
+    agent_config.permission_mode = permission;
+    agent_config.permission_timeout = Duration::from_secs(ctx.config.permissions.timeout_secs);
     // The loop's own default is the same value; reading it from the config is
     // what makes `[context] trim_threshold_chars` able to override it.
     agent_config.context_trim_threshold = ctx.config.context.trim_threshold_chars;
@@ -102,7 +126,7 @@ pub(crate) async fn execute(command: RunCommand, ctx: &AppContext) -> anyhow::Re
     }
     // The pipeline is attached only when the config asks for it, and the run says
     // so once: a security control the operator cannot see is one they cannot trust.
-    if let Some(pipeline) = guardrail_pipeline(&ctx.config.guardrails)? {
+    if let Some(pipeline) = guardrail_pipeline(&ctx.config.guardrails, permission)? {
         eprintln!("-- guardrails on: {}", pipeline.names().join(", "));
         agent_config = agent_config.with_guardrails(pipeline);
     }
@@ -166,7 +190,10 @@ fn to_anyhow(err: HarnessError) -> anyhow::Error {
 ///
 /// The guard set mirrors [`GuardrailPipeline::standard`]; the loop detector's
 /// threshold is the one from the config rather than the library default.
-fn guardrail_pipeline(config: &GuardrailsConfig) -> anyhow::Result<Option<Arc<GuardrailPipeline>>> {
+fn guardrail_pipeline(
+    config: &GuardrailsConfig,
+    permission: PermissionMode,
+) -> anyhow::Result<Option<Arc<GuardrailPipeline>>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -174,7 +201,11 @@ fn guardrail_pipeline(config: &GuardrailsConfig) -> anyhow::Result<Option<Arc<Gu
         Arc::new(SecretScanner::new().map_err(to_anyhow)?),
         Arc::new(PiiDetector::new().map_err(to_anyhow)?),
         Arc::new(ContentFence::new().map_err(to_anyhow)?),
-        Arc::new(ToolPolicy::destructive_defaults().map_err(to_anyhow)?),
+        Arc::new(
+            ToolPolicy::destructive_defaults()
+                .map_err(to_anyhow)?
+                .with_mode(permission),
+        ),
         Arc::new(BehaviorMonitor::new(config.max_identical_tool_calls)),
     ]))))
 }
@@ -551,12 +582,16 @@ mod tests {
 
     #[test]
     fn guardrails_switched_off_build_no_pipeline() {
-        assert!(guardrail_pipeline(&config(false, 3)).unwrap().is_none());
+        assert!(
+            guardrail_pipeline(&config(false, 3), PermissionMode::FullAuto)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn guardrails_switched_on_build_the_standard_guard_set() {
-        let pipeline = guardrail_pipeline(&config(true, 3))
+        let pipeline = guardrail_pipeline(&config(true, 3), PermissionMode::FullAuto)
             .unwrap()
             .expect("a pipeline when enabled");
         assert_eq!(
@@ -572,10 +607,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_configured_permission_tier_reaches_the_tool_policy() {
+        let pipeline = guardrail_pipeline(&config(true, 3), PermissionMode::AlwaysAsk)
+            .unwrap()
+            .expect("a pipeline when enabled");
+        let call = GuardContext::tool_call("read_file", serde_json::json!({ "path": "a.txt" }));
+
+        let inspection = pipeline.inspect(&call).await.unwrap();
+        assert!(
+            inspection.approval.is_some(),
+            "an always-ask run must gate even a read"
+        );
+    }
+
+    #[tokio::test]
     async fn the_loop_detector_uses_the_configured_threshold() {
         // A threshold of two refuses the third identical call, where the
         // library's own default of three would still allow it.
-        let pipeline = guardrail_pipeline(&config(true, 2))
+        let pipeline = guardrail_pipeline(&config(true, 2), PermissionMode::FullAuto)
             .unwrap()
             .expect("a pipeline when enabled");
         let call = GuardContext::tool_call("list_dir", serde_json::json!({ "path": "." }));

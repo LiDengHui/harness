@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 import { ApiError, getJson, requestFailureText } from '../api/http';
+import ApprovalPrompt from '../components/ApprovalPrompt.vue';
 import ConnectionBadge from '../components/ConnectionBadge.vue';
 import DiagnosticsStrip from '../components/DiagnosticsStrip.vue';
 import HistoryView from '../components/HistoryView.vue';
@@ -18,7 +19,12 @@ import {
   type WorkflowJobState,
 } from '../protocol';
 import { useAgentsStore } from '../stores/agents';
-import { useSessionStore, type ComposerMode } from '../stores/session';
+import {
+  DEFAULT_PERMISSION_MODE,
+  useSessionStore,
+  type ComposerMode,
+  type PermissionMode,
+} from '../stores/session';
 import {
   laneTarget,
   planNodeStatus,
@@ -194,6 +200,16 @@ const queued = computed(() =>
  */
 const workflowJobs = computed(() =>
   selectedId.value === null ? [] : sessions.workflowJobs(selectedId.value),
+);
+
+/**
+ * The tool calls the session on screen is waiting on a decision for.
+ *
+ * Read from the session's own pending list rather than from the error-shaped
+ * entries in its transcript: the entries are the log, this is the live request.
+ */
+const approvals = computed(() =>
+  selectedId.value === null ? [] : sessions.approvals(selectedId.value),
 );
 
 /** The plan of the run on screen, or `null` when it has none. */
@@ -435,6 +451,84 @@ watch(
     // The draft is spent: a session started later gets the configured default
     // rather than inheriting a choice made for a conversation that already ran.
     delete effortBySession.value[DRAFT_EFFORT_KEY];
+  },
+);
+
+/**
+ * The permission tiers the composer offers, and the words for each.
+ *
+ * `value` is the wire token the server accepts; the label and hint say what the
+ * tier allows in a person's words, because the token is not what the choice
+ * means to the reader. `Record<PermissionMode, …>` keeps the table complete the
+ * same way the effort table beside it does.
+ */
+const PERMISSION_WORDING: Record<PermissionMode, { label: string; hint: string }> = {
+  always_ask: {
+    label: 'chat.composer.permission.alwaysAsk',
+    hint: 'chat.composer.permission.hint.alwaysAsk',
+  },
+  ask_when_needed: {
+    label: 'chat.composer.permission.askWhenNeeded',
+    hint: 'chat.composer.permission.hint.askWhenNeeded',
+  },
+  full_auto: {
+    label: 'chat.composer.permission.fullAuto',
+    hint: 'chat.composer.permission.hint.fullAuto',
+  },
+};
+
+/** The tiers, from the most cautious to the most permissive. */
+const PERMISSION_MODES = ['always_ask', 'ask_when_needed', 'full_auto'] as const;
+const permissionOptions = PERMISSION_MODES.map((value) => ({
+  value,
+  ...PERMISSION_WORDING[value],
+}));
+
+/**
+ * The key the tier is filed under while no session is on screen.
+ *
+ * A sentinel like the effort key, and separate from it, so a tier picked for a
+ * first message is never mistaken for one picked for a session named ''.
+ */
+const DRAFT_PERMISSION_KEY = '';
+
+/**
+ * The permission tier chosen per session, for the life of the page.
+ *
+ * Keyed exactly like the thinking level above, and deliberately not in
+ * `localStorage` for the same reason: how freely a run may use tools belongs to
+ * a conversation, so a reload is allowed to forget it.
+ */
+const permissionBySession = ref<Record<string, PermissionMode>>({});
+
+/** The session the tier is chosen for: the one the composer addresses. */
+const permissionKey = computed(() => selectedId.value ?? DRAFT_PERMISSION_KEY);
+
+/** The tier the composer will send, at the middle default until touched. */
+const permission = computed<PermissionMode>({
+  get: () => permissionBySession.value[permissionKey.value] ?? DEFAULT_PERMISSION_MODE,
+  set: (value) => {
+    permissionBySession.value[permissionKey.value] = value;
+  },
+});
+
+/**
+ * The tier a first message went out at, held until the session it opens exists.
+ *
+ * Mirrors `pendingEffort` for the same reason: the choice is read before the
+ * session has an id to be filed under, and the session it opens should inherit
+ * it rather than the control appearing to reset.
+ */
+const pendingPermission = ref<PermissionMode | null>(null);
+
+watch(
+  () => sessions.liveSessionId,
+  (id, previous) => {
+    if (id === null || previous !== null || pendingPermission.value === null) return;
+    const tier = pendingPermission.value;
+    pendingPermission.value = null;
+    if (permissionBySession.value[id] === undefined) permissionBySession.value[id] = tier;
+    delete permissionBySession.value[DRAFT_PERMISSION_KEY];
   },
 );
 
@@ -954,6 +1048,7 @@ function send(): void {
   if (text === '') return;
   const agent = chosenAgent.value === '' ? null : chosenAgent.value;
   const level = effort.value;
+  const tier = permission.value;
   // A chosen workflow decides what the send is: the task is queued against that
   // recipe, and the plan comes from it rather than from the planner.
   if (chosenWorkflow.value !== '') {
@@ -969,10 +1064,14 @@ function send(): void {
     draft.value = '';
     return;
   }
-  if (!sessions.sendMessage(text, agent, selectedId.value, level)) return;
-  // A first message's level has no session to be filed under yet, so it waits
-  // for the session the send opens. See `pendingEffort`.
-  if (selectedId.value === null) pendingEffort.value = level;
+  if (!sessions.sendMessage(text, agent, selectedId.value, level, tier)) return;
+  // A first message's level and tier have no session to be filed under yet, so
+  // they wait for the session the send opens. See `pendingEffort` and
+  // `pendingPermission`.
+  if (selectedId.value === null) {
+    pendingEffort.value = level;
+    pendingPermission.value = tier;
+  }
   draft.value = '';
 }
 
@@ -993,6 +1092,16 @@ function sendSteering(): void {
 /** Stops the selected session's run, so the control follows the pane. */
 function abortSelected(): void {
   sessions.abort(undefined, selectedId.value);
+}
+
+/**
+ * Answers one waiting tool call, addressed to the session on screen.
+ *
+ * The reason is left off: the panel offers a plain approve or deny, and a
+ * refusal with no explanation is still a decision the server can act on.
+ */
+function answerApproval(toolCallId: string, approved: boolean): void {
+  sessions.respondToApproval(toolCallId, approved, null, selectedId.value);
 }
 
 function startNewSession(): void {
@@ -1259,6 +1368,13 @@ onMounted(() => {
       </header>
 
       <!--
+        The approval panel. It is docked inside the chat column and carries no
+        backdrop, so the session rail and the top navigation stay clickable while
+        a decision waits. Its own styles explain why its z-index is capped.
+      -->
+      <ApprovalPrompt v-if="approvals.length > 0" :items="approvals" @answer="answerApproval" />
+
+      <!--
         The plan checklist: the steps the run on screen is executing.
 
         It is a status list, not a second transcript — one row per plan node,
@@ -1498,6 +1614,35 @@ onMounted(() => {
           <span v-if="mode === 'plan'" class="muted tiny plan-hint">
             {{ t('chat.composer.planHint') }}
           </span>
+
+          <!--
+            The permission tier, beside the send mode because both decide how
+            the next message runs: the mode picks what is asked for, the tier
+            says how much the agent may do without checking back. It is a
+            segmented control rather than a menu so all three tiers are visible,
+            and each button carries what its tier allows.
+          -->
+          <span class="muted tiny composer-permission-label">
+            {{ t('chat.composer.permission.label') }}
+          </span>
+          <span
+            class="permission-modes"
+            role="group"
+            :aria-label="t('chat.composer.permission.label')"
+          >
+            <button
+              v-for="option in permissionOptions"
+              :key="option.value"
+              class="btn btn-small"
+              :class="{ 'btn-primary': permission === option.value }"
+              type="button"
+              :title="t(option.hint)"
+              @click="permission = option.value"
+            >
+              {{ t(option.label) }}
+            </button>
+          </span>
+
           <!--
             What the chosen workflow is for, in the reader's own words. The
             option in the picker carries the same `when`, but it is only visible
@@ -1908,7 +2053,14 @@ onMounted(() => {
   flex: none;
 }
 
+/*
+ * `relative` is what the approval panel is positioned against. It is docked
+ * inside this column rather than over the whole viewport, which is what keeps it
+ * off the rail on desktop and below the navigation on every viewport. See
+ * ApprovalPrompt.vue for the z-index contract.
+ */
 .chat-main {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -2348,6 +2500,12 @@ onMounted(() => {
   align-items: center;
   gap: 0.4rem;
   flex-wrap: wrap;
+}
+
+/* The three permission tiers read as one control, not three loose buttons. */
+.permission-modes {
+  display: inline-flex;
+  gap: 0.25rem;
 }
 
 /* The readout is the row's last item, so it is pushed to the far end. */

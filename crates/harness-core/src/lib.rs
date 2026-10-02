@@ -11,14 +11,16 @@ pub mod id;
 pub mod memory;
 pub mod message;
 pub mod path;
+pub mod permission;
 pub mod tokens;
 pub mod tool;
 
 pub use config::{
     global_dir, project_dir, resolve_thinking_effort, Config, GuardrailsConfig, HarnessSection,
-    McpConfig, McpServerConfig, McpTransportKind, MemoryConfig, ProviderConfig, ProviderKind,
-    ProviderSection, ServerConfig, ThinkingConfig, ToolsConfig, UiConfig, DEFAULT_THINKING_EFFORT,
-    HARNESS_DIR, SUPPORTED_THINKING_EFFORTS, SUPPORTED_UI_LANGUAGES,
+    McpConfig, McpServerConfig, McpTransportKind, MemoryConfig, PermissionsConfig, ProviderConfig,
+    ProviderKind, ProviderSection, ServerConfig, ThinkingConfig, ToolsConfig, UiConfig,
+    DEFAULT_PERMISSION_TIMEOUT_SECS, DEFAULT_THINKING_EFFORT, HARNESS_DIR,
+    SUPPORTED_THINKING_EFFORTS, SUPPORTED_UI_LANGUAGES,
 };
 pub use error::{HarnessError, Result};
 pub use event::{
@@ -31,5 +33,6 @@ pub use memory::{
     TrimOptions, TrimReport,
 };
 pub use message::{Message, Role, ToolCall};
+pub use permission::{classify, mode_requires_approval, PermissionMode, ToolRisk};
 pub use tokens::{HeuristicEstimator, TokenEstimator, TokenUsage};
 pub use tool::{object_schema, ToolSpec};

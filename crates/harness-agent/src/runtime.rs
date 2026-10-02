@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use harness_core::{AgentId, HarnessError, Memory, Result, SessionId};
+use harness_core::{AgentId, HarnessError, Memory, PermissionMode, Result, SessionId};
 use harness_llm::Provider;
 use harness_tools::ToolRegistry;
 
@@ -93,6 +93,16 @@ impl AgentRuntime {
             .as_deref()
             .and_then(harness_core::resolve_thinking_effort)
             .map(str::to_string);
+        // The spec's own tier, when it named one the harness recognises; the
+        // caller that knows whether a human is attached resolves the rest.
+        if let Some(mode) = self
+            .spec
+            .permission_mode
+            .as_deref()
+            .and_then(PermissionMode::parse)
+        {
+            config.permission_mode = mode;
+        }
         config.max_iterations = self.max_iterations;
         // Names only: the loop loads the registry and resolves them into the
         // prompt's index at construction, so nothing is read here.
@@ -291,6 +301,7 @@ mod tests {
             model: Some("deepseek/deepseek-reasoner".into()),
             temperature: Some(0.2),
             thinking_effort: Some("MAX".into()),
+            permission_mode: Some("always_ask".into()),
             max_tokens: Some(16_384),
             system_prompt: "You are terse.".into(),
             ..Default::default()
@@ -306,6 +317,7 @@ mod tests {
         // Canonicalised to the supported spelling, so the loop carries a value
         // the gateway accepts.
         assert_eq!(config.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(config.permission_mode, PermissionMode::AlwaysAsk);
         assert_eq!(config.max_iterations, 7);
         assert_eq!(runtime.model.source, crate::router::ModelSource::Agent);
     }
@@ -323,6 +335,22 @@ mod tests {
         assert_eq!(
             runtime.agent_config(SessionId::new()).reasoning_effort,
             None
+        );
+    }
+
+    #[test]
+    fn an_unsupported_spec_permission_mode_leaves_the_default() {
+        let spec = AgentSpec {
+            id: "tester".into(),
+            permission_mode: Some("sometimes".into()),
+            system_prompt: "Body.".into(),
+            ..Default::default()
+        };
+
+        let runtime = build(&spec, &ToolRegistry::with_builtins()).unwrap();
+        assert_eq!(
+            runtime.agent_config(SessionId::new()).permission_mode,
+            PermissionMode::FullAuto
         );
     }
 

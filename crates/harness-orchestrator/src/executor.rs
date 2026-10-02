@@ -329,7 +329,19 @@ impl Executor {
                                 handle.steer(&text, priority);
                             }
                         }
-                        Some(ControlMessage::ToolApproval { .. }) => {}
+                        Some(ControlMessage::ToolApproval {
+                            tool_call_id,
+                            approved,
+                            reason,
+                        }) => {
+                            // Every node has its own control handle and the
+                            // executor has no way to tell which one raised the
+                            // request, so the answer goes to all of them; a node
+                            // whose call id does not match ignores it.
+                            for handle in &handles {
+                                handle.approve(tool_call_id.clone(), approved, reason.clone());
+                            }
+                        }
                         None => control_open = false,
                     },
 

@@ -31,6 +31,7 @@ pub(crate) async fn execute(command: WebCommand, ctx: &AppContext) -> anyhow::Re
         command.port,
         command.provider.as_deref(),
         command.effort.as_deref(),
+        command.permission.as_deref(),
     )?;
 
     let port = config.server.port;
@@ -304,6 +305,7 @@ mod tests {
             port: None,
             provider: None,
             effort: None,
+            permission: None,
             no_open: true,
             local,
         }

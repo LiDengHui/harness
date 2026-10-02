@@ -50,6 +50,17 @@ export default {
       plan: '拆分任务',
       planTitle: '先让智能体把任务拆成若干步骤，再分派给子智能体执行',
       planHint: '智能体会先给出一份计划并分派出去，而不是自己一口气做完',
+      permission: {
+        label: '权限',
+        alwaysAsk: '始终询问',
+        askWhenNeeded: '必要时询问',
+        fullAuto: '完全自动',
+        hint: {
+          alwaysAsk: '每次工具调用都先征求同意，未批准不执行',
+          askWhenNeeded: '只在调用缺少本次运行还没有的权限时询问',
+          fullAuto: '所有工具调用直接执行，不再询问',
+        },
+      },
       agentDefault: '智能体：默认',
       workflowLabel: '工作流',
       workflowAuto: '工作流：自动',
@@ -71,6 +82,19 @@ export default {
       steer: '插话',
       steeringIdle: '只有任务执行中才能插话',
       steeringSent: '已送达正在执行的任务：{text}',
+    },
+
+    /**
+     * 授权面板：某个工具调用被拦下，等待用户决定。它不阻塞页面 —— 会话栏和导航
+     * 依然可点 —— 所以措辞是“请求”，而不是“警报”。
+     */
+    approval: {
+      heading: '有工具调用需要你的授权',
+      waiting: '共 {count} 项待处理',
+      tool: '工具：{name}',
+      reason: '被拦下的原因：{reason}',
+      approve: '批准',
+      deny: '拒绝',
     },
 
     lane: {

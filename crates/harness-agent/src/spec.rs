@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use harness_core::{frontmatter, HarnessError, Result};
+use harness_core::{frontmatter, HarnessError, PermissionMode, Result};
 use serde::{Deserialize, Serialize};
 
 /// One agent as declared by a file.
@@ -31,6 +31,10 @@ pub struct AgentSpec {
     /// Reasoning effort this agent asks for, e.g. `"max"`. `None` inherits the
     /// configured default; an unsupported value is ignored rather than sent.
     pub thinking_effort: Option<String>,
+    /// Permission tier this agent asks to run under, e.g. `"always_ask"`.
+    /// `None` inherits the configured default; an unrecognised value is ignored
+    /// rather than carried, and the recognised spelling is what is kept.
+    pub permission_mode: Option<String>,
     /// Tool whitelist. Empty means "every registered tool".
     pub tools: Vec<String>,
     pub skills: Vec<String>,
@@ -82,6 +86,13 @@ impl AgentSpec {
         spec.id = id;
         spec.name = name;
         spec.description = spec.description.trim().to_string();
+        // Canonicalised here so an unrecognised spelling is dropped rather than
+        // carried: a mode the harness does not know must not read as a choice.
+        spec.permission_mode = spec
+            .permission_mode
+            .as_deref()
+            .and_then(PermissionMode::parse)
+            .map(|mode| mode.as_str().to_string());
         spec.system_prompt = body;
         spec.source_path = source_path;
         Ok(spec)
@@ -138,6 +149,7 @@ description: Designs backend systems.
 model: deepseek/deepseek-chat
 temperature: 0.2
 thinking_effort: max
+permission_mode: always_ask
 tools:
   - read_file
   - grep
@@ -160,6 +172,7 @@ Prefer interfaces over implementations.
         assert_eq!(spec.model.as_deref(), Some("deepseek/deepseek-chat"));
         assert_eq!(spec.temperature, Some(0.2));
         assert_eq!(spec.thinking_effort.as_deref(), Some("max"));
+        assert_eq!(spec.permission_mode.as_deref(), Some("always_ask"));
         assert_eq!(spec.tools, vec!["read_file", "grep"]);
         assert_eq!(spec.skills, vec!["system-design"]);
         assert_eq!(spec.subagents, vec!["code-reviewer"]);
@@ -256,6 +269,17 @@ Prefer interfaces over implementations.
     fn an_agent_with_no_id_anywhere_is_an_error() {
         let err = parse("Body only.", "   ").unwrap_err();
         assert!(err.to_string().contains("no id"), "{err}");
+    }
+
+    #[test]
+    fn a_permission_mode_is_canonicalised_and_an_unknown_one_is_dropped() {
+        let canonical = parse("---\npermission_mode: Always_Ask\n---\nBody.", "agent").unwrap();
+        assert_eq!(canonical.permission_mode.as_deref(), Some("always_ask"));
+
+        // An unrecognised mode is ignored rather than carried, so it cannot read
+        // as a deliberate choice downstream.
+        let unknown = parse("---\npermission_mode: sometimes\n---\nBody.", "agent").unwrap();
+        assert_eq!(unknown.permission_mode, None);
     }
 
     #[test]

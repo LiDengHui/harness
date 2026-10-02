@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harness_core::{
-    AgentEvent, AgentId, CompletionReason, Priority, Result, SessionId, TokenUsage, ToolCallStatus,
+    AgentEvent, AgentId, CompletionReason, PermissionMode, Priority, Result, SessionId, TokenUsage,
+    ToolCallStatus,
 };
-use harness_guardrails::GuardrailPipeline;
+use harness_guardrails::{GuardReport, GuardrailPipeline};
 use harness_llm::{ChatRequest, Message, Provider, ProviderEvent, Role, ToolCall};
 use harness_skills::SkillRegistry;
 use harness_tools::{ToolContext, ToolOutput, ToolRegistry};
@@ -25,7 +26,7 @@ use crate::budget::{BudgetState, TokenBudget};
 use crate::control::{ControlChannel, ControlMessage};
 use crate::guardrails::{
     refuse_tool_call, screen_assistant_output, screen_tool_call, screen_tool_output,
-    screen_user_message,
+    screen_user_message, Screened,
 };
 use crate::prompt;
 use crate::record::TurnRecorder;
@@ -105,6 +106,14 @@ pub struct AgentConfig {
     ///
     /// A per-run override from [`AgentLoop::run_with_effort`] outranks it.
     pub reasoning_effort: Option<String>,
+    /// The permission tier this run's tools are judged under.
+    ///
+    /// A per-run override handed to [`AgentLoop::run_persisting_with_effort`]
+    /// outranks it, which is how a message that asks for a different tier is
+    /// honoured by a loop built for the whole session.
+    pub permission_mode: PermissionMode,
+    /// How long a gated tool call waits for a human before it is refused.
+    pub permission_timeout: Duration,
     pub max_iterations: usize,
     /// Skills the agent's `.agent.md` declared, by name.
     ///
@@ -160,6 +169,8 @@ impl AgentConfig {
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
+            permission_mode: PermissionMode::FullAuto,
+            permission_timeout: Duration::from_secs(harness_core::DEFAULT_PERMISSION_TIMEOUT_SECS),
             max_iterations: 32,
             skills: Vec::new(),
             guardrails: None,
@@ -289,8 +300,16 @@ impl AgentLoop {
         // No recorder: the cursor opens at the head, so nothing is ever handed
         // to a sink. `run_persisting*` is the entry point that writes as it goes.
         let recorded = history.len();
-        self.run_persisting_with_effort(history, events, control, None, recorded, reasoning_effort)
-            .await
+        self.run_persisting_with_effort(
+            history,
+            events,
+            control,
+            None,
+            recorded,
+            reasoning_effort,
+            None,
+        )
+        .await
     }
 
     /// [`Self::run`], persisting the conversation as it is produced.
@@ -309,8 +328,16 @@ impl AgentLoop {
         recorder: &dyn TurnRecorder,
         persisted: usize,
     ) -> Result<RunOutcome> {
-        self.run_persisting_with_effort(history, events, control, Some(recorder), persisted, None)
-            .await
+        self.run_persisting_with_effort(
+            history,
+            events,
+            control,
+            Some(recorder),
+            persisted,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`Self::run_with_effort`] with incremental persistence.
@@ -319,6 +346,12 @@ impl AgentLoop {
     /// should use. The caller must not also append `history[persisted..]` once
     /// the run returns: the loop has already recorded those messages, and a
     /// second pass would duplicate them in the DAG.
+    ///
+    /// `permission_mode` is this run's tier when the caller resolved one
+    /// (message > agent > config); it outranks the config's own for the whole
+    /// run, which is what lets one message in a session ask more or less than
+    /// the session's default.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_persisting_with_effort(
         &self,
         history: &mut Vec<Message>,
@@ -327,6 +360,7 @@ impl AgentLoop {
         recorder: Option<&dyn TurnRecorder>,
         persisted: usize,
         reasoning_effort: Option<&str>,
+        permission_mode: Option<PermissionMode>,
     ) -> Result<RunOutcome> {
         // A stale or out-of-range offset must not index out of bounds; clamping
         // keeps the cursor inside the history it tracks.
@@ -337,6 +371,7 @@ impl AgentLoop {
                 events,
                 control,
                 reasoning_effort,
+                permission_mode,
                 recorder,
                 &mut recorded,
             )
@@ -361,12 +396,14 @@ impl AgentLoop {
 
     /// The loop itself. [`Self::run_with_effort`] wraps it so the tool-result
     /// invariant is restored on every exit, including the error ones.
+    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
         history: &mut Vec<Message>,
         events: &mpsc::UnboundedSender<AgentEvent>,
         control: &mut ControlChannel,
         reasoning_effort: Option<&str>,
+        permission_mode: Option<PermissionMode>,
         recorder: Option<&dyn TurnRecorder>,
         recorded: &mut usize,
     ) -> Result<RunOutcome> {
@@ -415,7 +452,13 @@ impl AgentLoop {
                             events,
                         ));
                     }
-                    ControlMessage::ToolApproval { .. } => {}
+                    ControlMessage::ToolApproval { .. } => {
+                        // An approval the loop did not consume at a gate is
+                        // stale: the only place one is awaited is the tool
+                        // batch, and it parks an early answer in `pending` until
+                        // the matching call reaches the gate. Anything still
+                        // here belongs to a call already answered.
+                    }
                 }
             }
             // Steering pushed above is part of the conversation; record it at the
@@ -597,6 +640,7 @@ impl AgentLoop {
                     control,
                     &mut pending,
                     &mut activated,
+                    permission_mode,
                 )
                 .await?;
 
@@ -909,7 +953,9 @@ impl AgentLoop {
     /// Runs every requested tool in parallel, returning results in call order.
     ///
     /// A call a guardrail refuses is never executed; it is answered with a
-    /// synthetic failure so the provider still sees one result per call.
+    /// synthetic failure so the provider still sees one result per call. A call
+    /// the permission tier gates pauses the batch until a human answers or the
+    /// configured timeout refuses it, so a run with nobody attached still ends.
     async fn run_tool_batch(
         &self,
         calls: &[ToolCall],
@@ -917,11 +963,13 @@ impl AgentLoop {
         control: &mut ControlChannel,
         pending: &mut VecDeque<ControlMessage>,
         activated: &mut HashSet<String>,
+        permission_mode: Option<PermissionMode>,
     ) -> Result<(Vec<(ToolCall, ToolOutput)>, bool)> {
         let mut set: JoinSet<(ToolCall, ToolOutput, u64)> = JoinSet::new();
         let mut outstanding: HashMap<String, ToolCall> = HashMap::new();
         let mut order: HashMap<String, usize> = HashMap::new();
         let mut results: Vec<(ToolCall, ToolOutput)> = Vec::new();
+        let mut aborted = false;
 
         for (index, call) in calls.iter().enumerate() {
             emit(
@@ -952,11 +1000,33 @@ impl AgentLoop {
             }
 
             let mut call = call.clone();
-            let refused = screen_tool_call(self.pipeline(), &mut call, events).await?;
-            if let Some(report) = refused {
-                let output = refuse_tool_call(events, &call, &report);
-                results.push((call, output));
-                continue;
+            match screen_tool_call(self.pipeline(), &mut call, events, permission_mode).await? {
+                Screened::Allowed => {}
+                Screened::Refused(report) => {
+                    let output = refuse_tool_call(events, &call, &report);
+                    results.push((call, output));
+                    continue;
+                }
+                Screened::NeedsApproval(report) => {
+                    match self
+                        .await_approval(&call, &report, events, control, pending)
+                        .await
+                    {
+                        Approval::Approved => {}
+                        Approval::Refused(report) => {
+                            let output = refuse_tool_call(events, &call, &report);
+                            results.push((call, output));
+                            continue;
+                        }
+                        Approval::Aborted => {
+                            // Left outstanding so the cleanup below answers it;
+                            // the batch stops here.
+                            outstanding.insert(call.id.clone(), call);
+                            aborted = true;
+                            break;
+                        }
+                    }
+                }
             }
 
             let tool = self.tools.get(&call.name);
@@ -977,14 +1047,12 @@ impl AgentLoop {
         }
 
         let mut control_open = true;
-        let mut aborted = false;
-        while !set.is_empty() {
+        while !aborted && !set.is_empty() {
             tokio::select! {
                 biased;
 
                 message = control.raw().recv(), if control_open => match message {
                     Some(ControlMessage::Abort { .. }) => {
-                        abort_tools(&self.tool_ctx, &mut set).await;
                         aborted = true;
                         break;
                     }
@@ -1004,6 +1072,11 @@ impl AgentLoop {
                     None => break,
                 },
             }
+        }
+        // Tools already spawned get their grace period here, whether the abort
+        // arrived at a gate or while the batch was running.
+        if aborted {
+            abort_tools(&self.tool_ctx, &mut set).await;
         }
 
         // Every call leaves this function with a result. The assistant message
@@ -1027,6 +1100,87 @@ impl AgentLoop {
 
         results.sort_by_key(|(call, _)| order.get(&call.id).copied().unwrap_or(usize::MAX));
         Ok((results, aborted))
+    }
+
+    /// Raises a `tool_approval` request for one call and waits for the answer.
+    ///
+    /// The wait is bounded: a client that never answers must not hang the run,
+    /// so the call is refused when the timeout expires, with a reason naming the
+    /// timeout so the model can tell it apart from a policy refusal. An abort
+    /// still lands here, because the batch is paused and this is the only place
+    /// listening for it.
+    ///
+    /// An answer that arrived while an earlier call in the batch was waiting is
+    /// parked in `pending` rather than dropped — the control channel is
+    /// unbounded, so the reply is still there to be picked up when its call
+    /// reaches the gate.
+    async fn await_approval(
+        &self,
+        call: &ToolCall,
+        report: &GuardReport,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        control: &mut ControlChannel,
+        pending: &mut VecDeque<ControlMessage>,
+    ) -> Approval {
+        emit(
+            events,
+            AgentEvent::ToolApprovalRequest {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                reason: report.detail.clone(),
+            },
+        );
+
+        let timeout = self.config.permission_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let parked = pending.iter().position(|message| {
+                matches!(
+                    message,
+                    ControlMessage::ToolApproval { tool_call_id, .. } if tool_call_id == &call.id
+                )
+            });
+            if let Some(index) = parked {
+                if let Some(ControlMessage::ToolApproval {
+                    approved, reason, ..
+                }) = pending.remove(index)
+                {
+                    return approval_outcome(approved, reason, report);
+                }
+            }
+
+            match tokio::time::timeout_at(deadline, control.raw().recv()).await {
+                Err(_) => {
+                    return Approval::Refused(GuardReport {
+                        name: report.name.clone(),
+                        detail: format!(
+                            "no answer within {}s, so the call was refused; {}",
+                            timeout.as_secs(),
+                            report.detail
+                        ),
+                    })
+                }
+                Ok(None) => {
+                    return Approval::Refused(GuardReport {
+                        name: report.name.clone(),
+                        detail: format!(
+                            "the run's control channel closed while the call waited; {}",
+                            report.detail
+                        ),
+                    })
+                }
+                Ok(Some(ControlMessage::ToolApproval {
+                    tool_call_id,
+                    approved,
+                    reason,
+                })) if tool_call_id == call.id => {
+                    return approval_outcome(approved, reason, report);
+                }
+                Ok(Some(ControlMessage::Abort { .. })) => return Approval::Aborted,
+                Ok(Some(other)) => pending.push_back(other),
+            }
+        }
     }
 
     /// Answers a `request_tools` call: activates the named tools and returns
@@ -1090,6 +1244,33 @@ impl AgentLoop {
             usage,
         }
     }
+}
+
+/// The answer to a gated tool call.
+enum Approval {
+    Approved,
+    /// Refused, by the user or by the wait expiring.
+    Refused(GuardReport),
+    /// The user aborted the run while the call waited.
+    Aborted,
+}
+
+/// Turns a `ToolApproval` answer into the outcome the gate acts on.
+///
+/// A refusal keeps the asking guard's name so the model sees which policy it
+/// ran into, and folds in the user's own reason when they gave one.
+fn approval_outcome(approved: bool, reason: Option<String>, report: &GuardReport) -> Approval {
+    if approved {
+        return Approval::Approved;
+    }
+    let detail = match reason.map(|reason| reason.trim().to_string()) {
+        Some(reason) if !reason.is_empty() => format!("the user refused: {reason}"),
+        _ => "the user refused".to_string(),
+    };
+    Approval::Refused(GuardReport {
+        name: report.name.clone(),
+        detail,
+    })
 }
 
 /// Signals the shared abort flag first, then gives tools a moment to notice it.
@@ -3212,5 +3393,206 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // the permission gate
+    // -----------------------------------------------------------------------
+
+    fn gated_policy(mode: PermissionMode) -> GuardrailPipeline {
+        GuardrailPipeline::new(vec![Arc::new(ToolPolicy::new().with_mode(mode))])
+    }
+
+    /// Reads events on a task of its own and answers the first approval request,
+    /// so the run can block on the gate while the test observes it.
+    ///
+    /// The receiver is moved onto the task, and the shared log it returns is
+    /// enough for assertions after the run ends.
+    fn approving_collector(
+        mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+        handle: ControlHandle,
+        approved: bool,
+    ) -> (Arc<Mutex<Vec<AgentEvent>>>, tokio::task::JoinHandle<()>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collector_seen = Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let AgentEvent::ToolApprovalRequest { tool_call_id, .. } = &event {
+                    handle.approve(tool_call_id.clone(), approved, None);
+                }
+                collector_seen.lock().unwrap().push(event);
+            }
+        });
+        (seen, task)
+    }
+
+    #[tokio::test]
+    async fn an_approval_gate_runs_the_call_only_after_it_is_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), "gated content").unwrap();
+
+        let agent = agent_with(
+            config(),
+            gated_policy(PermissionMode::AlwaysAsk),
+            tmp.path(),
+        );
+
+        let (events, rx) = mpsc::unbounded_channel();
+        let (handle, mut control) = ControlHandle::channel();
+        let (seen, collector) = approving_collector(rx, handle, true);
+
+        let mut history = vec![Message::user("read note.txt")];
+        let outcome = agent
+            .run(&mut history, &events, &mut control)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, CompletionReason::EndTurn);
+        drop(events);
+        collector.await.unwrap();
+
+        let tool_message = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("the approved call produced a result");
+        assert!(
+            tool_message.text().contains("gated content"),
+            "an approved call must actually run: {}",
+            tool_message.text()
+        );
+
+        let emitted = seen.lock().unwrap().clone();
+        assert!(emitted
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolApprovalRequest { .. })));
+        assert!(emitted.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallEnd { status, .. } if *status == ToolCallStatus::Ok)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_gate_answers_the_call_and_the_run_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), "must not be read").unwrap();
+
+        let agent = agent_with(
+            config(),
+            gated_policy(PermissionMode::AlwaysAsk),
+            tmp.path(),
+        );
+
+        let (events, rx) = mpsc::unbounded_channel();
+        let (handle, mut control) = ControlHandle::channel();
+        let (seen, collector) = approving_collector(rx, handle, false);
+
+        let mut history = vec![Message::user("read note.txt")];
+        let outcome = agent
+            .run(&mut history, &events, &mut control)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, CompletionReason::EndTurn);
+        drop(events);
+        collector.await.unwrap();
+
+        let tool_message = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("a refused call is still answered");
+        assert!(
+            tool_message.text().contains("the user refused"),
+            "{}",
+            tool_message.text()
+        );
+        assert!(
+            !tool_message.text().contains("must not be read"),
+            "a refused call must not have run: {}",
+            tool_message.text()
+        );
+
+        let emitted = seen.lock().unwrap().clone();
+        assert!(emitted.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallEnd { status, .. } if *status == ToolCallStatus::Rejected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_is_never_answered_times_out_and_refuses_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), "content").unwrap();
+
+        let mut agent_config = config();
+        agent_config.permission_timeout = Duration::from_millis(200);
+        let agent = agent_with(
+            agent_config,
+            gated_policy(PermissionMode::AlwaysAsk),
+            tmp.path(),
+        );
+
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (_handle, mut control) = ControlHandle::channel();
+        let mut history = vec![Message::user("read note.txt")];
+
+        // Nobody answers, so the run must not hang: the gate expires and the
+        // model sees a refusal naming the timeout.
+        let outcome = agent
+            .run(&mut history, &events, &mut control)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, CompletionReason::EndTurn);
+
+        let tool_message = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("the timed-out call is answered");
+        assert!(
+            tool_message.text().contains("no answer within"),
+            "{}",
+            tool_message.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_run_tier_override_outranks_the_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), "content").unwrap();
+
+        // The policy gates everything, but this run asks for full auto, and the
+        // override is what the gate must obey.
+        let agent = agent_with(
+            config(),
+            gated_policy(PermissionMode::AlwaysAsk),
+            tmp.path(),
+        );
+
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let (_handle, mut control) = ControlHandle::channel();
+        let mut history = vec![Message::user("read note.txt")];
+
+        let outcome = agent
+            .run_persisting_with_effort(
+                &mut history,
+                &events,
+                &mut control,
+                None,
+                0,
+                None,
+                Some(PermissionMode::FullAuto),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, CompletionReason::EndTurn);
+
+        drop(events);
+        let emitted = collect(&mut rx);
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolApprovalRequest { .. })),
+            "a full-auto override must not raise a gate"
+        );
+        let tool_message = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .unwrap();
+        assert!(tool_message.text().contains("content"));
     }
 }

@@ -119,6 +119,7 @@ async fn the_agent_named_on_a_user_message_is_the_one_that_runs() {
             text: "hello".to_string(),
             agent_id: Some(AgentId::new("test").expect("a valid id")),
             effort: None,
+            permission_mode: None,
         },
     )
     .await;
@@ -144,6 +145,7 @@ async fn an_unknown_agent_is_refused_before_a_session_is_created() {
             text: "hello".to_string(),
             agent_id: Some(AgentId::new("nobody").expect("a valid id")),
             effort: None,
+            permission_mode: None,
         },
     )
     .await;

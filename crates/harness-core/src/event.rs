@@ -152,6 +152,16 @@ pub enum AgentEvent {
         blocked: bool,
         detail: String,
     },
+    /// A tool call is gated by the permission policy and is waiting for a human.
+    ///
+    /// The loop emits this and then blocks, so a client that never answers
+    /// leaves the call to be refused when the configured timeout expires.
+    ToolApprovalRequest {
+        tool_call_id: String,
+        name: String,
+        arguments: Value,
+        reason: String,
+    },
     Error {
         message: String,
     },
@@ -225,6 +235,13 @@ pub enum ClientMessage {
         /// see `harness_core::resolve_thinking_effort` for the accepted set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Permission mode for this run only, outranking the agent's own
+        /// declaration and the configured default.
+        ///
+        /// Free text for the same forward-compatibility reason as `effort`: an
+        /// unrecognised value is read and ignored rather than failing the frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
     },
     /// Decompose a task into a DAG and run it through the orchestrator, which
     /// reports itself with `subtask_start` / `subtask_end` / `agent_handoff`.
@@ -490,6 +507,17 @@ impl From<AgentEvent> for ServerMessage {
                 blocked,
                 detail,
             },
+            AgentEvent::ToolApprovalRequest {
+                tool_call_id,
+                name,
+                arguments,
+                reason,
+            } => ServerMessage::ToolApprovalRequest {
+                tool_call_id,
+                name,
+                arguments,
+                reason,
+            },
             AgentEvent::Error { message } => ServerMessage::Error {
                 code: "agent_error".to_string(),
                 message,
@@ -640,11 +668,13 @@ mod tests {
             text: "think hard".into(),
             agent_id: None,
             effort: Some("max".into()),
+            permission_mode: Some("always_ask".into()),
         });
 
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["type"], "user_message");
         assert_eq!(json["effort"], "max");
+        assert_eq!(json["permission_mode"], "always_ask");
         let back: ClientEnvelope = serde_json::from_value(json).unwrap();
         assert_eq!(back.message, envelope.message);
 
@@ -654,9 +684,11 @@ mod tests {
             text: "plain".into(),
             agent_id: None,
             effort: None,
+            permission_mode: None,
         });
         let json = serde_json::to_value(&bare).unwrap();
         assert!(json.get("effort").is_none());
+        assert!(json.get("permission_mode").is_none());
         let back: ClientEnvelope = serde_json::from_value(json).unwrap();
         assert_eq!(back.message, bare.message);
     }
@@ -919,6 +951,19 @@ mod tests {
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"tool_approval_request\""));
+
+        // The loop only holds the internal stream, so the request has to survive
+        // the conversion the server's event bridge performs.
+        let event = AgentEvent::ToolApprovalRequest {
+            tool_call_id: "call_9".into(),
+            name: "shell".into(),
+            arguments: json!({ "command": "rm -rf /" }),
+            reason: "destructive command".into(),
+        };
+        let json = serde_json::to_value(ServerMessage::from(event)).unwrap();
+        assert_eq!(json["type"], "tool_approval_request");
+        assert_eq!(json["tool_call_id"], "call_9");
+        assert_eq!(json["reason"], "destructive command");
     }
 
     #[test]

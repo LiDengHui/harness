@@ -268,6 +268,14 @@ export type ClientMessage =
        * choice the reader made and silently dropping it would ignore that.
        */
       effort?: Effort | null;
+      /**
+       * How freely this run may use tools, for this run only.
+       *
+       * Optional on the wire — a frame without it runs at the server's own
+       * default — and the values are the three tiers the composer offers:
+       * `always_ask`, `ask_when_needed` and `full_auto`.
+       */
+      permission_mode?: string | null;
     }
   | {
       /**

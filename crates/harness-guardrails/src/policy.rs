@@ -1,7 +1,7 @@
 //! Allow/deny rules over the tool calls a model asks for.
 
 use async_trait::async_trait;
-use harness_core::{HarnessError, Result};
+use harness_core::{classify, mode_requires_approval, HarnessError, PermissionMode, Result};
 use regex::Regex;
 
 use crate::{GuardContext, GuardSource, GuardVerdict, Guardrail};
@@ -9,7 +9,10 @@ use crate::{GuardContext, GuardSource, GuardVerdict, Guardrail};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
     Allow,
+    /// Refuse outright; the permission tier cannot reopen it.
     Deny,
+    /// Let the call proceed only if a human approves it.
+    Ask,
 }
 
 #[derive(Debug)]
@@ -36,15 +39,20 @@ impl Rule {
     }
 }
 
-/// Refuses tool calls that match a deny rule.
+/// Refuses or gates tool calls that match a rule, and gates the rest by risk.
 ///
 /// `Allow` rules are consulted first, so an exception always wins over a
-/// broader `Deny` no matter which was declared first. A call that matches no
-/// rule at all is allowed, which keeps a policy written as a denylist a
-/// denylist.
+/// broader `Ask` or `Deny` no matter which was declared first. `Ask` rules come
+/// next, ahead of `Deny`, so a policy can name a call that is approvable where
+/// the rest of its tool is not. A call that matches no rule is still judged by
+/// the run's permission tier, and only a tier that asks nothing lets it through
+/// untouched — which keeps a policy written as a denylist a denylist while
+/// still making "always ask" mean what it says.
 #[derive(Debug, Default)]
 pub struct ToolPolicy {
     rules: Vec<Rule>,
+    /// The tier used when the inspected call carries none of its own.
+    mode: PermissionMode,
 }
 
 impl ToolPolicy {
@@ -52,8 +60,20 @@ impl ToolPolicy {
         Self::default()
     }
 
+    /// Sets the tier the policy judges by when a call does not name one.
+    ///
+    /// A per-call override on the [`GuardContext`] outranks it, which is how a
+    /// per-message mode reaches a policy that was built for the whole session.
+    pub fn with_mode(mut self, mode: PermissionMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     /// The rules a run gets by default: recursive deletes aimed at the
     /// filesystem root, which no agent task legitimately needs.
+    ///
+    /// Both are `Deny` and stay `Deny`: this is a hard block, not a question, so
+    /// the permission tier cannot turn it into an approval.
     pub fn destructive_defaults() -> Result<Self> {
         let mut policy = Self::new();
         policy.deny(
@@ -67,6 +87,32 @@ impl ToolPolicy {
             "formatting a filesystem",
         )?;
         Ok(policy)
+    }
+
+    /// Asks for `tool` when its serialized arguments match `arguments`.
+    pub fn ask(
+        &mut self,
+        tool: impl Into<String>,
+        arguments: impl AsRef<str>,
+        detail: impl Into<String>,
+    ) -> Result<&mut Self> {
+        self.push(
+            PolicyAction::Ask,
+            Some(tool.into()),
+            Some(arguments),
+            detail,
+        )
+    }
+
+    /// Asks for every call to `tool`, whatever the arguments.
+    pub fn ask_tool(&mut self, tool: impl Into<String>, detail: impl Into<String>) -> &mut Self {
+        self.rules.push(Rule {
+            tool: Some(tool.into()),
+            arguments: None,
+            action: PolicyAction::Ask,
+            detail: detail.into(),
+        });
+        self
     }
 
     /// Denies `tool` when its serialized arguments match `arguments`.
@@ -95,7 +141,8 @@ impl ToolPolicy {
         self
     }
 
-    /// Permits `tool` when its arguments match, whatever the deny rules say.
+    /// Permits `tool` when its arguments match, whatever the ask or deny rules
+    /// say.
     pub fn allow(
         &mut self,
         tool: impl Into<String>,
@@ -145,24 +192,43 @@ impl Guardrail for ToolPolicy {
         }
         let name = ctx.tool_name.as_deref().unwrap_or_default();
 
-        let permitted = self
+        // An explicit exception outranks every rule and the tier alike.
+        if self
             .rules
             .iter()
-            .any(|rule| rule.action == PolicyAction::Allow && rule.matches(name, &ctx.text));
-        if permitted {
+            .any(|rule| rule.action == PolicyAction::Allow && rule.matches(name, &ctx.text))
+        {
             return Ok(GuardVerdict::Allow);
         }
-
-        match self
+        // An explicit ask outranks a deny, so a policy can make one call to a
+        // tool approvable without opening the rest of it.
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .find(|rule| rule.action == PolicyAction::Ask && rule.matches(name, &ctx.text))
+        {
+            return Ok(GuardVerdict::Ask {
+                detail: format!("tool `{name}`: {}", rule.detail),
+            });
+        }
+        // A deny is final: the tier below must not turn it into a question.
+        if let Some(rule) = self
             .rules
             .iter()
             .find(|rule| rule.action == PolicyAction::Deny && rule.matches(name, &ctx.text))
         {
-            Some(rule) => Ok(GuardVerdict::Block {
+            return Ok(GuardVerdict::Block {
                 detail: format!("tool `{name}`: {}", rule.detail),
-            }),
-            None => Ok(GuardVerdict::Allow),
+            });
         }
+
+        let mode = ctx.permission_mode.unwrap_or(self.mode);
+        if mode_requires_approval(mode, classify(name)) {
+            return Ok(GuardVerdict::Ask {
+                detail: format!("tool `{name}` needs approval under `{}`", mode.as_str()),
+            });
+        }
+        Ok(GuardVerdict::Allow)
     }
 }
 
@@ -241,5 +307,120 @@ mod tests {
         let mut policy = ToolPolicy::new();
         let err = policy.deny("shell", "rm -rf (", "unbalanced").unwrap_err();
         assert!(err.to_string().contains("invalid"), "{err}");
+    }
+
+    async fn inspect_under(
+        policy: &ToolPolicy,
+        mode: PermissionMode,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> GuardVerdict {
+        policy
+            .inspect(&GuardContext::tool_call(name, arguments).with_permission_mode(mode))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_tier_gates_calls_no_rule_mentions() {
+        let policy = ToolPolicy::new().with_mode(PermissionMode::AskWhenNeeded);
+
+        assert_eq!(
+            inspect(&policy, "read_file", json!({ "path": "a.txt" })).await,
+            GuardVerdict::Allow,
+            "a read changes nothing, so asking about it is noise"
+        );
+        assert!(matches!(
+            inspect(&policy, "write_file", json!({ "path": "a.txt" })).await,
+            GuardVerdict::Ask { .. }
+        ));
+        assert!(matches!(
+            inspect(&policy, "shell", json!({ "command": "ls" })).await,
+            GuardVerdict::Ask { .. }
+        ));
+        // An unknown tool is treated as consequential rather than waved through.
+        assert!(matches!(
+            inspect(&policy, "mystery", json!({})).await,
+            GuardVerdict::Ask { .. }
+        ));
+
+        let always = ToolPolicy::new().with_mode(PermissionMode::AlwaysAsk);
+        assert!(matches!(
+            inspect(&always, "read_file", json!({ "path": "a.txt" })).await,
+            GuardVerdict::Ask { .. }
+        ));
+
+        let auto = ToolPolicy::new().with_mode(PermissionMode::FullAuto);
+        assert_eq!(
+            inspect(&auto, "shell", json!({ "command": "ls" })).await,
+            GuardVerdict::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_call_tier_outranks_the_one_the_policy_was_built_with() {
+        let policy = ToolPolicy::new().with_mode(PermissionMode::FullAuto);
+
+        // The session tier says nothing is asked, but this run's override does.
+        assert!(matches!(
+            inspect_under(
+                &policy,
+                PermissionMode::AlwaysAsk,
+                "read_file",
+                json!({ "path": "a.txt" })
+            )
+            .await,
+            GuardVerdict::Ask { .. }
+        ));
+        // And the other way round: the override can also stop the asking.
+        let asking = ToolPolicy::new().with_mode(PermissionMode::AskWhenNeeded);
+        assert_eq!(
+            inspect_under(&asking, PermissionMode::FullAuto, "shell", json!({})).await,
+            GuardVerdict::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_outranks_a_deny_and_an_allow_outranks_both() {
+        let mut policy = ToolPolicy::new().with_mode(PermissionMode::FullAuto);
+        policy.deny_tool("shell", "no shell by default");
+        policy.ask_tool("shell", "shell needs a human");
+
+        // Ask beats Deny.
+        assert!(matches!(
+            inspect(&policy, "shell", json!({ "command": "ls" })).await,
+            GuardVerdict::Ask { .. }
+        ));
+
+        // Allow beats both.
+        policy
+            .allow("shell", r#""command":"git status""#, "read-only git")
+            .unwrap();
+        assert_eq!(
+            inspect(&policy, "shell", json!({ "command": "git status" })).await,
+            GuardVerdict::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tier_never_reopens_a_deny() {
+        let mut policy = ToolPolicy::new().with_mode(PermissionMode::FullAuto);
+        policy
+            .deny("shell", r"rm\s+-rf\s+/", "destructive command")
+            .unwrap();
+
+        for mode in [
+            PermissionMode::AlwaysAsk,
+            PermissionMode::AskWhenNeeded,
+            PermissionMode::FullAuto,
+        ] {
+            assert!(
+                matches!(
+                    inspect_under(&policy, mode, "shell", json!({ "command": "rm -rf /" })).await,
+                    GuardVerdict::Block { .. }
+                ),
+                "a deny must stay a deny under {mode:?}"
+            );
+        }
     }
 }

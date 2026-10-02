@@ -27,6 +27,7 @@ pub(crate) async fn execute(command: ServeCommand, ctx: &AppContext) -> anyhow::
         command.port,
         command.provider.as_deref(),
         None,
+        command.permission.as_deref(),
     )?;
 
     print_network_notice(
@@ -92,6 +93,7 @@ pub(crate) fn resolve_config(
     port: Option<u16>,
     provider: Option<&str>,
     effort: Option<&str>,
+    permission: Option<&str>,
 ) -> anyhow::Result<harness_core::Config> {
     let mut config = ctx.config.clone();
 
@@ -119,6 +121,14 @@ pub(crate) fn resolve_config(
     // on every message, where it would fail opaquely.
     if let Some(requested) = effort {
         config.thinking.effort = supported_effort(requested)?.to_string();
+    }
+
+    // `--permission` moves the configured default the same way `--effort` does:
+    // a message or an agent file that names a tier still outranks it. Validated
+    // here so an unrecognised tier is refused at startup rather than silently
+    // falling back on every message.
+    if let Some(requested) = permission {
+        config.permissions.mode = Some(supported_permission(requested)?);
     }
 
     // A bind that anything on the network can reach must not also be open to
@@ -197,6 +207,15 @@ fn supported_effort(requested: &str) -> anyhow::Result<&'static str> {
         anyhow::anyhow!(
             "unsupported thinking effort `{requested}`; supported: {}",
             harness_core::SUPPORTED_THINKING_EFFORTS.join(", ")
+        )
+    })
+}
+
+/// Canonicalises a permission tier from a flag, refusing an unrecognised one.
+fn supported_permission(requested: &str) -> anyhow::Result<harness_core::PermissionMode> {
+    harness_core::PermissionMode::parse(requested).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported permission mode `{requested}`; supported: always_ask, ask_when_needed, full_auto"
         )
     })
 }

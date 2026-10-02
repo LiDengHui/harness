@@ -310,6 +310,29 @@ describe('client frames', () => {
     expect(raw).not.toContain('effort');
   });
 
+  it('round-trips the chosen permission tier through the wire and back through JSON', () => {
+    const raw = serializeClientEnvelope(
+      clientEnvelope(
+        { type: 'user_message', text: 'keep it safe', permission_mode: 'ask_when_needed' },
+        { sessionId: 'sess_1' },
+      ),
+    );
+
+    expect(JSON.parse(raw)).toEqual({
+      v: 1,
+      session_id: 'sess_1',
+      type: 'user_message',
+      text: 'keep it safe',
+      permission_mode: 'ask_when_needed',
+    });
+  });
+
+  it('omits the permission tier when the caller names none', () => {
+    const raw = serializeClientEnvelope(clientEnvelope({ type: 'user_message', text: 'hi' }));
+
+    expect(raw).not.toContain('permission_mode');
+  });
+
   it('leaves the thinking level off a plan request, which carries no such field', () => {
     const raw = serializeClientEnvelope(
       clientEnvelope({ type: 'plan_task', task: 'split the refactor' }),

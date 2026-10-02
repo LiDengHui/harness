@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use harness_core::{
-    AgentId, ClientEnvelope, ClientMessage, Config, McpServerConfig, Message, ProviderConfig,
-    ProviderKind, ServerEnvelope, ServerMessage, SessionId,
+    AgentId, ClientEnvelope, ClientMessage, Config, McpServerConfig, Message, PermissionMode,
+    ProviderConfig, ProviderKind, ServerEnvelope, ServerMessage, SessionId,
 };
 use harness_llm::{MockProvider, Provider, ScriptedTurn};
 use harness_orchestrator::WorkflowSelector;
@@ -63,6 +63,11 @@ impl Fixture {
         );
         // Absolute, so the store is never written into the repository.
         config.memory.db_path = self.db_path();
+        // The server default is ask-when-needed, but these tests have no UI to
+        // answer a gate and use `shell` calls to observe abort and queueing. A
+        // full-auto fixture keeps them about what they are about; the gate has
+        // its own tests.
+        config.permissions.mode = Some(PermissionMode::FullAuto);
         config.server.host = "127.0.0.1".to_string();
         config.server.port = 0;
         for (name, server) in &self.mcp {
@@ -377,6 +382,7 @@ pub fn user_message(text: &str) -> ClientMessage {
         text: text.to_string(),
         agent_id: None,
         effort: None,
+        permission_mode: None,
     }
 }
 
@@ -386,6 +392,7 @@ pub fn user_message_with_effort(text: &str, effort: &str) -> ClientMessage {
         text: text.to_string(),
         agent_id: None,
         effort: Some(effort.to_string()),
+        permission_mode: None,
     }
 }
 

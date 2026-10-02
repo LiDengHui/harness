@@ -5,7 +5,7 @@
 //! stream and onto whatever replaces the content: a redaction rewrites it, a
 //! block substitutes a refusal.
 
-use harness_core::{AgentEvent, Result, ToolCallStatus};
+use harness_core::{AgentEvent, PermissionMode, Result, ToolCallStatus};
 use harness_guardrails::{GuardContext, GuardReport, GuardrailPipeline, Inspection};
 use harness_llm::{Message, ToolCall};
 use harness_tools::ToolOutput;
@@ -73,21 +73,38 @@ pub(crate) async fn screen_assistant_output(
     screen_text(pipeline, GuardContext::assistant_output(text), events).await
 }
 
+/// What screening decided about one tool call.
+#[derive(Debug)]
+pub(crate) enum Screened {
+    /// The call may run.
+    Allowed,
+    /// A guard refused it outright, and the permission tier cannot reopen that.
+    Refused(GuardReport),
+    /// A guard or the permission tier wants a human to approve it first.
+    NeedsApproval(GuardReport),
+}
+
 /// Screens one tool call.
 ///
-/// Returns the report of the guard that refused it, if any. A redaction
-/// rewrites the arguments in place, which keeps a call alive with a scrubbed
-/// payload rather than dropping it.
+/// `permission_mode` is this run's tier when it differs from the one the policy
+/// was built with; it is attached to the context so a per-run choice reaches a
+/// policy that was constructed for the whole session. A redaction rewrites the
+/// arguments in place, which keeps a call alive with a scrubbed payload rather
+/// than dropping it.
 pub(crate) async fn screen_tool_call(
     pipeline: Option<&GuardrailPipeline>,
     call: &mut ToolCall,
     events: &mpsc::UnboundedSender<AgentEvent>,
-) -> Result<Option<GuardReport>> {
-    let ctx = GuardContext::tool_call(&call.name, call.arguments.clone());
+    permission_mode: Option<PermissionMode>,
+) -> Result<Screened> {
+    let mut ctx = GuardContext::tool_call(&call.name, call.arguments.clone());
+    if let Some(mode) = permission_mode {
+        ctx = ctx.with_permission_mode(mode);
+    }
     let inspection = screen(pipeline, &ctx, events).await?;
 
     if let Some(report) = &inspection.blocked {
-        return Ok(Some(report.clone()));
+        return Ok(Screened::Refused(report.clone()));
     }
     if !inspection.redactions.is_empty() {
         // The pipeline rewrote the serialized arguments; keep the call only
@@ -96,7 +113,10 @@ pub(crate) async fn screen_tool_call(
             call.arguments = value;
         }
     }
-    Ok(None)
+    match &inspection.approval {
+        Some(report) => Ok(Screened::NeedsApproval(report.clone())),
+        None => Ok(Screened::Allowed),
+    }
 }
 
 /// Answers a tool call a guardrail refused.
@@ -153,4 +173,101 @@ fn emit_report(events: &mpsc::UnboundedSender<AgentEvent>, report: &GuardReport,
 /// failure and stop retrying the same thing.
 fn refusal_text(report: &GuardReport) -> String {
     format!("refused by guardrail `{}`: {}", report.name, report.detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_guardrails::{SecretScanner, ToolPolicy};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments: json!({ "path": "a.txt" }),
+        }
+    }
+
+    fn pipeline(policy: ToolPolicy) -> GuardrailPipeline {
+        GuardrailPipeline::new(vec![Arc::new(policy)])
+    }
+
+    #[tokio::test]
+    async fn a_call_no_guard_mentions_is_allowed() {
+        let (events, _rx) = mpsc::unbounded_channel();
+        let mut call = call("read_file");
+
+        let screened = screen_tool_call(None, &mut call, &events, None)
+            .await
+            .unwrap();
+        assert!(matches!(screened, Screened::Allowed), "{screened:?}");
+    }
+
+    #[tokio::test]
+    async fn a_deny_is_refused_and_an_ask_needs_approval() {
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        let mut denying = ToolPolicy::new();
+        denying.deny_tool("shell", "no shell");
+        let mut shell = call("shell");
+        let screened = screen_tool_call(Some(&pipeline(denying)), &mut shell, &events, None)
+            .await
+            .unwrap();
+        assert!(matches!(screened, Screened::Refused(_)), "{screened:?}");
+
+        let mut asking = ToolPolicy::new();
+        asking.ask_tool("shell", "shell needs a human");
+        let mut shell = call("shell");
+        let screened = screen_tool_call(Some(&pipeline(asking)), &mut shell, &events, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(screened, Screened::NeedsApproval(_)),
+            "{screened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tier_attached_to_the_context_reaches_the_policy() {
+        let (events, _rx) = mpsc::unbounded_channel();
+        // The policy was built for full auto, but this run's override asks.
+        let policy = ToolPolicy::new().with_mode(PermissionMode::FullAuto);
+
+        let mut shell = call("shell");
+        let screened = screen_tool_call(
+            Some(&pipeline(policy)),
+            &mut shell,
+            &events,
+            Some(PermissionMode::AlwaysAsk),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(screened, Screened::NeedsApproval(_)),
+            "{screened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redaction_rewrites_the_arguments_and_still_allows_the_call() {
+        let (events, _rx) = mpsc::unbounded_channel();
+        let pipeline = GuardrailPipeline::new(vec![Arc::new(SecretScanner::new().unwrap())]);
+        let mut call = ToolCall {
+            id: "call_1".into(),
+            name: "write_file".into(),
+            arguments: json!({ "path": "a.txt", "content": "key AKIAIOSFODNN7EXAMPLE" }),
+        };
+
+        let screened = screen_tool_call(Some(&pipeline), &mut call, &events, None)
+            .await
+            .unwrap();
+        assert!(matches!(screened, Screened::Allowed), "{screened:?}");
+
+        // The secret never survives into the call that would be executed.
+        let rendered = call.arguments.to_string();
+        assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"), "{rendered}");
+        assert!(rendered.contains("[redacted:aws_key]"), "{rendered}");
+    }
 }

@@ -141,6 +141,22 @@ export interface ErrorEntry {
 export type TimelineEntry = UserEntry | TurnEntry | HandoffEntry | SubtaskEntry | ErrorEntry;
 
 /**
+ * A tool call stopped until a human decides.
+ *
+ * Kept apart from the error-shaped entry that records it: the entry is the log
+ * line, this is the live request the dialog answers. The arguments ride along
+ * because the decision is made from them — the tool's name alone does not say
+ * what the call is about to do.
+ */
+export interface PendingApproval {
+  toolCallId: string;
+  name: string;
+  arguments: JsonValue;
+  reason: string;
+  at: number;
+}
+
+/**
  * One step of the plan the current run is executing.
  *
  * `id` is the plan node id, which is also the `subtask_id` its `subtask_start`
@@ -331,6 +347,8 @@ export interface Transcript {
   plan: RunPlan | null;
   /** Workflow jobs this session has queued, running or finished. */
   workflowQueue: WorkflowJob[];
+  /** Tool calls stopped until the user decides; the dialog is driven by this. */
+  approvals: PendingApproval[];
 }
 
 /** A transcript container: the main timeline and every lane are both targets. */
@@ -361,6 +379,7 @@ export function createTranscript(sessionId: string): Transcript {
     queue: [],
     plan: null,
     workflowQueue: [],
+    approvals: [],
   };
 }
 
@@ -382,6 +401,20 @@ export function removeUserEntry(transcript: Transcript, id: string): boolean {
   const index = transcript.entries.findIndex((entry) => entry.kind === 'user' && entry.id === id);
   if (index < 0) return false;
   transcript.entries.splice(index, 1);
+  return true;
+}
+
+/**
+ * Clears a pending approval once it has been answered.
+ *
+ * The error-shaped entry that recorded the request stays in the log — the
+ * decision is part of the run's history — but the live request goes, so the
+ * dialog stops offering a choice that has already been made.
+ */
+export function removeApproval(transcript: Transcript, toolCallId: string): boolean {
+  const index = transcript.approvals.findIndex((item) => item.toolCallId === toolCallId);
+  if (index < 0) return false;
+  transcript.approvals.splice(index, 1);
   return true;
 }
 
@@ -940,8 +973,8 @@ export function foldFrame(
       return;
 
     case 'tool_approval_request': {
-      // Rendered as an error-shaped entry until a card can carry the decision:
-      // the transcript should not silently omit a tool waiting on a human.
+      // The log keeps an error-shaped entry, so the transcript does not silently
+      // omit a tool waiting on a human.
       const entry: ErrorEntry = {
         kind: 'error',
         id: nextId('approval'),
@@ -956,6 +989,26 @@ export function foldFrame(
         },
       };
       transcript.entries.push(entry);
+      // The dialog reads this list rather than scanning the entries above, so a
+      // request and its log line can be worded independently. A repeated request
+      // for the same call refreshes the item instead of stacking a second one.
+      const existing = transcript.approvals.find(
+        (item) => item.toolCallId === envelope.tool_call_id,
+      );
+      if (existing) {
+        existing.name = envelope.name;
+        existing.arguments = envelope.arguments;
+        existing.reason = envelope.reason;
+        existing.at = at;
+      } else {
+        transcript.approvals.push({
+          toolCallId: envelope.tool_call_id,
+          name: envelope.name,
+          arguments: envelope.arguments,
+          reason: envelope.reason,
+          at,
+        });
+      }
       return;
     }
 

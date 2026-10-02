@@ -248,6 +248,102 @@ describe('session store', () => {
     expect(socket.sent[socket.sent.length - 1]).not.toContain('effort');
   });
 
+  it('carries the chosen permission tier on the message it applies to', () => {
+    const sessions = store();
+    deliver({ type: 'session_started', model: 'mock-1' });
+
+    sessions.sendMessage('be careful with this one', null, undefined, undefined, 'always_ask');
+
+    expect(JSON.parse(socket.sent[socket.sent.length - 1] as string)).toEqual({
+      v: 1,
+      session_id: 'sess_1',
+      type: 'user_message',
+      text: 'be careful with this one',
+      permission_mode: 'always_ask',
+    });
+  });
+
+  it('leaves the permission tier off a message sent with no opinion', () => {
+    const sessions = store();
+    deliver({ type: 'session_started', model: 'mock-1' });
+
+    sessions.sendMessage('no opinion on permissions');
+
+    expect(socket.sent[socket.sent.length - 1]).not.toContain('permission_mode');
+  });
+
+  it('keeps a tool approval request as a pending item the dialog can read', () => {
+    const sessions = store();
+    deliver({ type: 'session_started', model: 'mock-1' });
+
+    deliver({
+      type: 'tool_approval_request',
+      tool_call_id: 'call_7',
+      name: 'shell',
+      arguments: { command: 'rm -rf build' },
+      reason: 'the command writes outside the workspace',
+    });
+
+    expect(sessions.approvals('sess_1')).toEqual([
+      {
+        toolCallId: 'call_7',
+        name: 'shell',
+        arguments: { command: 'rm -rf build' },
+        reason: 'the command writes outside the workspace',
+        at: expect.any(Number),
+      },
+    ]);
+    // The log entry stays too, so the request is not lost from the transcript.
+    expect(errorEntries(sessions, 'sess_1')).toBe(1);
+  });
+
+  it('answers a pending approval and clears it', () => {
+    const sessions = store();
+    deliver({ type: 'session_started', model: 'mock-1' });
+    deliver({
+      type: 'tool_approval_request',
+      tool_call_id: 'call_7',
+      name: 'shell',
+      arguments: {},
+      reason: 'needs a decision',
+    });
+
+    sessions.respondToApproval('call_7', true);
+
+    expect(JSON.parse(socket.sent[socket.sent.length - 1] as string)).toEqual({
+      v: 1,
+      session_id: 'sess_1',
+      type: 'tool_approval',
+      tool_call_id: 'call_7',
+      approved: true,
+    });
+    expect(sessions.approvals('sess_1')).toEqual([]);
+  });
+
+  it('sends a denial with its reason', () => {
+    const sessions = store();
+    deliver({ type: 'session_started', model: 'mock-1' });
+    deliver({
+      type: 'tool_approval_request',
+      tool_call_id: 'call_8',
+      name: 'write_file',
+      arguments: {},
+      reason: 'needs a decision',
+    });
+
+    sessions.respondToApproval('call_8', false, 'not this file');
+
+    expect(JSON.parse(socket.sent[socket.sent.length - 1] as string)).toEqual({
+      v: 1,
+      session_id: 'sess_1',
+      type: 'tool_approval',
+      tool_call_id: 'call_8',
+      approved: false,
+      reason: 'not this file',
+    });
+    expect(sessions.approvals('sess_1')).toEqual([]);
+  });
+
   it('refuses an empty message instead of sending one', () => {
     const sessions = store();
     expect(sessions.sendMessage('   ')).toBe(false);

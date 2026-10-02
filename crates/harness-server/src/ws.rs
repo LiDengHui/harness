@@ -34,8 +34,8 @@ use futures::{SinkExt, StreamExt};
 use harness_agent::{ControlChannel, MemoryRecorder, ModelRouter};
 use harness_core::{
     AgentEvent, AgentId, ClientEnvelope, ClientMessage, CompletionReason, Config, HarnessError,
-    Message, PlanNode, Result, RoutedEvent, ServerEnvelope, ServerMessage, SessionId,
-    SubtaskStatus, PROTOCOL_VERSION,
+    Message, PermissionMode, PlanNode, Result, RoutedEvent, ServerEnvelope, ServerMessage,
+    SessionId, SubtaskStatus, PROTOCOL_VERSION,
 };
 use harness_orchestrator::{
     ExecutionReport, Executor, ExecutorConfig, Planner, TaskGraph, TaskNode,
@@ -371,8 +371,9 @@ impl Connection {
                 text,
                 agent_id,
                 effort,
+                permission_mode,
             } => {
-                self.user_message(envelope.session_id, agent_id, text, effort)
+                self.user_message(envelope.session_id, agent_id, text, effort, permission_mode)
                     .await
             }
             ClientMessage::PlanTask { task, agent_id } => self.plan_task(agent_id, task).await,
@@ -476,6 +477,7 @@ impl Connection {
         agent_id: Option<AgentId>,
         text: String,
         effort: Option<String>,
+        permission_mode: Option<String>,
     ) -> bool {
         let record = match target {
             // A message that names a session addresses that session, whether or
@@ -511,14 +513,25 @@ impl Connection {
                 .to_string()
         };
 
+        // The tier for this run, resolved the same way: the message's request,
+        // the agent's declaration, the configured default, then ask-when-needed,
+        // which is this path's own default because a UI is attached and can
+        // answer. An unrecognised request on the message is ignored rather than
+        // sent, so a client the server does not understand cannot widen access.
+        let permission = permission_mode
+            .as_deref()
+            .and_then(PermissionMode::parse)
+            .unwrap_or(record.agent().config().permission_mode);
+
         // Attached before the message is admitted, so a run it starts cannot
         // emit an event this connection would miss.
         self.attach(Arc::clone(&record));
 
-        match record.admit(text, Some(effort)) {
+        match record.admit(text, Some(effort), Some(permission)) {
             Admit::Started {
                 text,
                 effort,
+                permission,
                 control,
             } => {
                 spawn_run(
@@ -526,6 +539,7 @@ impl Connection {
                     record,
                     text,
                     effort,
+                    permission,
                     control,
                     Arc::clone(&self.aborted),
                 );
@@ -814,6 +828,7 @@ pub(crate) fn spawn_run(
     record: Arc<SessionRecord>,
     text: String,
     effort: Option<String>,
+    permission: Option<PermissionMode>,
     mut control: ControlChannel,
     aborted: Arc<AtomicBool>,
 ) {
@@ -853,6 +868,7 @@ pub(crate) fn spawn_run(
                 Some(&recorder),
                 persisted,
                 effort.as_deref(),
+                permission,
             )
             .await;
         drop(events);
@@ -988,12 +1004,14 @@ fn spawn_next(state: &Arc<ServerState>, record: &Arc<SessionRecord>, aborted: Ar
         Some(NextRun::Message {
             text,
             effort,
+            permission,
             control,
         }) => spawn_run(
             Arc::clone(state),
             Arc::clone(record),
             text,
             effort,
+            permission,
             control,
             aborted,
         ),

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarnessError, Result};
+use crate::permission::PermissionMode;
 
 /// Name of the harness state directory, both global and per project.
 pub const HARNESS_DIR: &str = ".harness";
@@ -29,6 +30,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub mcp: McpConfig,
     pub guardrails: GuardrailsConfig,
+    pub permissions: PermissionsConfig,
     pub thinking: ThinkingConfig,
     pub context: ContextConfig,
     pub ui: UiConfig,
@@ -465,6 +467,35 @@ impl Default for GuardrailsConfig {
     }
 }
 
+/// How long a gated tool call waits for a human before it is refused.
+///
+/// A run with nobody attached must not hang forever on a question that will
+/// never be answered, so the wait is bounded even though the answer is not.
+pub const DEFAULT_PERMISSION_TIMEOUT_SECS: u64 = 300;
+
+/// How much a run asks before it acts.
+///
+/// `mode` is optional so that the *caller* can decide what an unset value means:
+/// a server session with a UI in front of it defaults to asking, while the
+/// headless `dhs run` defaults to full auto, because "ask when necessary"
+/// presupposes someone to ask. An explicit value applies everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    pub mode: Option<PermissionMode>,
+    /// How long a gated call waits for an answer before it is refused.
+    pub timeout_secs: u64,
+}
+
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            timeout_secs: DEFAULT_PERMISSION_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// Whether a run's result is checked before the run reports success.
 ///
 /// Empty by default: verification is opt-in, so a run that configures nothing is
@@ -893,6 +924,31 @@ max_identical_tool_calls = 5
         let partial: Config = toml::from_str("[guardrails]\nenabled = false\n").unwrap();
         assert!(!partial.guardrails.enabled);
         assert_eq!(partial.guardrails.max_identical_tool_calls, 3);
+    }
+
+    #[test]
+    fn permission_settings_parse_and_leave_the_default_to_the_caller() {
+        let parsed: Config =
+            toml::from_str("[permissions]\nmode = \"always_ask\"\ntimeout_secs = 30\n").unwrap();
+        assert_eq!(parsed.permissions.mode, Some(PermissionMode::AlwaysAsk));
+        assert_eq!(parsed.permissions.timeout_secs, 30);
+
+        // An unset mode is not a mode: the caller decides what it means, because
+        // a server has a UI to ask and a headless run does not.
+        let bare = Config::default();
+        assert_eq!(bare.permissions.mode, None);
+        assert_eq!(
+            bare.permissions.timeout_secs,
+            DEFAULT_PERMISSION_TIMEOUT_SECS
+        );
+
+        // A partial section fills the rest from the default.
+        let partial: Config = toml::from_str("[permissions]\n").unwrap();
+        assert_eq!(partial.permissions.mode, None);
+        assert_eq!(
+            partial.permissions.timeout_secs,
+            DEFAULT_PERMISSION_TIMEOUT_SECS
+        );
     }
 
     #[test]

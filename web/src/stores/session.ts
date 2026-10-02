@@ -52,7 +52,9 @@ import {
   isNoRunError,
   markRunAbandoned,
   markRunStarted,
+  removeApproval,
   removeUserEntry,
+  type PendingApproval,
   type QueuedMessage,
   type Transcript,
   type WorkflowJob,
@@ -93,6 +95,19 @@ function newestFirst(sessions: SessionInfo[]): SessionInfo[] {
  * delegated. It decides which client frame the text becomes.
  */
 export type ComposerMode = 'ask' | 'plan';
+
+/**
+ * How freely a run may use tools, sent as `permission_mode` on each message.
+ *
+ * These are the wire's three tiers and the only values the server accepts, so
+ * the UI must never offer or send another. The middle tier is the composer's
+ * starting point: it asks only when a call needs a permission the run does not
+ * already have, which is the least surprising default.
+ */
+export type PermissionMode = 'always_ask' | 'ask_when_needed' | 'full_auto';
+
+/** The tier a message carries when the user has not chosen one. */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = 'ask_when_needed';
 
 export const useSessionStore = defineStore('session', () => {
   const transcripts = ref<Record<string, Transcript>>({});
@@ -166,6 +181,11 @@ export const useSessionStore = defineStore('session', () => {
   /** How many workflow jobs a session is showing. */
   function workflowJobCount(sessionId: string): number {
     return transcripts.value[sessionId]?.workflowQueue.length ?? 0;
+  }
+
+  /** The tool calls a session is waiting on a human decision for. */
+  function approvals(sessionId: string): PendingApproval[] {
+    return transcripts.value[sessionId]?.approvals ?? [];
   }
 
   /**
@@ -323,11 +343,12 @@ export const useSessionStore = defineStore('session', () => {
   /**
    * Sends the composer's text as an ordinary question.
    *
-   * `effort` is the thinking level for this run. It rides on `user_message`
-   * only: a workflow job is decomposed before any model sees it, so there is no
-   * single run for a level to apply to, and the server's `QueueWorkflow` carries
-   * no such field. A level left out is left off the frame, which the server
-   * reads as its own configured default.
+   * `effort` is the thinking level and `permissionMode` is the tool-permission
+   * tier for this run. Both ride on `user_message` only: a workflow job is
+   * decomposed before any model sees it, so there is no single run for either to
+   * apply to, and the server's `QueueWorkflow` carries no such fields. A value
+   * left out is left off the frame, which the server reads as its own configured
+   * default.
    *
    * The target defaults to the session on screen and then to the live one, so
    * sending into a session opened for reading continues it instead of starting a
@@ -340,18 +361,15 @@ export const useSessionStore = defineStore('session', () => {
     agentId: string | null = null,
     targetSessionId?: string | null,
     effort?: Effort | null,
+    permissionMode?: PermissionMode | null,
   ): boolean {
     const text = rawText.trim();
     if (text === '') return false;
 
-    const message: ClientMessage =
-      agentId === null
-        ? effort == null
-          ? { type: 'user_message', text }
-          : { type: 'user_message', text, effort }
-        : effort == null
-          ? { type: 'user_message', text, agent_id: agentId }
-          : { type: 'user_message', text, agent_id: agentId, effort };
+    const message: ClientMessage = { type: 'user_message', text };
+    if (agentId !== null) message.agent_id = agentId;
+    if (effort != null) message.effort = effort;
+    if (permissionMode != null) message.permission_mode = permissionMode;
     const ws = useWebSocket();
     const target = targetSessionId ?? viewSessionId.value ?? liveSessionId.value;
 
@@ -466,6 +484,28 @@ export const useSessionStore = defineStore('session', () => {
       { type: 'abort', reason },
       target === null ? {} : { sessionId: target },
     );
+  }
+
+  /**
+   * Answers a tool call that is waiting on a human decision.
+   *
+   * Addressed like a send, so the reply reaches the session whose run is blocked
+   * rather than whichever session this connection last drove. The pending
+   * request is cleared once the frame is out, because the dialog must stop
+   * offering a choice the user has already made.
+   */
+  function respondToApproval(
+    toolCallId: string,
+    approved: boolean,
+    reason: string | null = null,
+    targetSessionId?: string | null,
+  ): void {
+    const target = targetSessionId ?? viewSessionId.value ?? liveSessionId.value;
+    const message: ClientMessage = { type: 'tool_approval', tool_call_id: toolCallId, approved };
+    if (reason != null) message.reason = reason;
+    useWebSocket().send(message, target === null ? {} : { sessionId: target });
+    const transcript = target === null ? null : transcripts.value[target];
+    if (transcript) removeApproval(transcript, toolCallId);
   }
 
   /**
@@ -603,6 +643,9 @@ export const useSessionStore = defineStore('session', () => {
       for (const transcript of Object.values(transcripts.value)) {
         if (transcript.status === 'running') markRunAbandoned(transcript);
         if (transcript.queue.length > 0) clearQueue(transcript);
+        // The run that was waiting on a decision is aborted server-side, so no
+        // answer can be delivered any more: the pending requests go with it.
+        if (transcript.approvals.length > 0) transcript.approvals = [];
       }
       liveSessionId.value = null;
       if (state === 'closed') pendingSends.length = 0;
@@ -639,6 +682,7 @@ export const useSessionStore = defineStore('session', () => {
     queuedMessages,
     workflowJobs,
     workflowJobCount,
+    approvals,
     canSend,
     ensureTranscript,
     ingest,
@@ -647,6 +691,7 @@ export const useSessionStore = defineStore('session', () => {
     runWorkflow,
     steer,
     abort,
+    respondToApproval,
     attach,
     viewLive,
     startNewSession,

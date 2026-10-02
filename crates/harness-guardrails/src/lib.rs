@@ -21,7 +21,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_core::Result;
+use harness_core::{PermissionMode, Result};
 use serde_json::Value;
 
 pub use behavior::BehaviorMonitor;
@@ -51,6 +51,14 @@ pub enum GuardVerdict {
     Block {
         detail: String,
     },
+    /// The content may proceed, but only if a human approves it first.
+    ///
+    /// Distinct from `Block` because a hard refusal is not approvable: a deny
+    /// rule is the operator saying "never", and the permission tier cannot
+    /// reopen it.
+    Ask {
+        detail: String,
+    },
     /// Keep the content, with `text` standing in for what was inspected.
     Redact {
         text: String,
@@ -69,6 +77,11 @@ pub struct GuardContext {
     pub tool_name: Option<String>,
     /// Set for [`GuardSource::ToolCall`].
     pub arguments: Option<Value>,
+    /// The permission tier in force for this call, when the caller has one.
+    ///
+    /// A tool policy consults it so that a per-run override can outrank the
+    /// tier the policy was built with; `None` means "use the policy's own".
+    pub permission_mode: Option<PermissionMode>,
 }
 
 impl GuardContext {
@@ -90,7 +103,14 @@ impl GuardContext {
             text: arguments.to_string(),
             tool_name: Some(name.into()),
             arguments: Some(arguments),
+            permission_mode: None,
         }
+    }
+
+    /// Sets the tier a tool policy judges this call under.
+    pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
+        self.permission_mode = Some(mode);
+        self
     }
 
     fn text(source: GuardSource, text: impl Into<String>) -> Self {
@@ -99,6 +119,7 @@ impl GuardContext {
             text: text.into(),
             tool_name: None,
             arguments: None,
+            permission_mode: None,
         }
     }
 }
@@ -131,6 +152,11 @@ pub struct Inspection {
     pub text: String,
     /// The guard that blocked, if any. The pipeline stops at the first one.
     pub blocked: Option<GuardReport>,
+    /// The guard that asked for approval, if any.
+    ///
+    /// A block outranks an ask: a call a deny rule refused is never put to the
+    /// user, because the operator already answered "no".
+    pub approval: Option<GuardReport>,
     /// Guards that rewrote the text, in the order they ran.
     pub redactions: Vec<GuardReport>,
 }
@@ -141,6 +167,7 @@ impl Inspection {
         Self {
             text: text.into(),
             blocked: None,
+            approval: None,
             redactions: Vec::new(),
         }
     }
@@ -185,6 +212,7 @@ impl GuardrailPipeline {
     pub async fn inspect(&self, ctx: &GuardContext) -> Result<Inspection> {
         let mut text = ctx.text.clone();
         let mut redactions = Vec::new();
+        let mut approval: Option<GuardReport> = None;
 
         for guard in &self.guards {
             let current = GuardContext {
@@ -200,7 +228,17 @@ impl GuardrailPipeline {
                             name: guard.name().to_string(),
                             detail,
                         }),
+                        approval: None,
                         redactions,
+                    });
+                }
+                GuardVerdict::Ask { detail } => {
+                    // Recorded rather than returned on the spot: a later guard
+                    // may still refuse the content outright, and a refusal is
+                    // not something a human can approve away.
+                    approval = Some(GuardReport {
+                        name: guard.name().to_string(),
+                        detail,
                     });
                 }
                 GuardVerdict::Redact {
@@ -219,6 +257,7 @@ impl GuardrailPipeline {
         Ok(Inspection {
             text,
             blocked: None,
+            approval,
             redactions,
         })
     }
@@ -348,6 +387,61 @@ mod tests {
             .map(|(name, _)| name.clone())
             .collect();
         assert_eq!(names, vec!["redactor", "blocker"]);
+    }
+
+    #[tokio::test]
+    async fn an_ask_is_recorded_and_a_hard_block_still_outranks_it() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = GuardrailPipeline::new(vec![Scripted::make(
+            "asker",
+            GuardVerdict::Ask {
+                detail: "needs a human".into(),
+            },
+            &log,
+        )]);
+
+        let outcome = pipeline
+            .inspect(&GuardContext::tool_call(
+                "shell",
+                serde_json::json!({ "command": "ls" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.blocked, None);
+        assert_eq!(
+            outcome.approval,
+            Some(GuardReport {
+                name: "asker".into(),
+                detail: "needs a human".into(),
+            })
+        );
+
+        // A question cannot reopen a refusal: a later block wins outright.
+        let pipeline = GuardrailPipeline::new(vec![
+            Scripted::make(
+                "asker",
+                GuardVerdict::Ask {
+                    detail: "needs a human".into(),
+                },
+                &log,
+            ),
+            Scripted::make(
+                "blocker",
+                GuardVerdict::Block {
+                    detail: "never".into(),
+                },
+                &log,
+            ),
+        ]);
+        let outcome = pipeline
+            .inspect(&GuardContext::tool_call("shell", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(outcome.approval.is_none());
+        assert_eq!(
+            outcome.blocked.map(|report| report.name),
+            Some("blocker".into())
+        );
     }
 
     #[tokio::test]

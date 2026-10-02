@@ -17,8 +17,8 @@ use harness_agent::{
     AgentLoop, AgentRegistry, AgentRuntime, AgentSpec, ControlChannel, ControlHandle, ModelRouter,
 };
 use harness_core::{
-    AgentId, Config, GuardrailsConfig, HarnessError, Memory, Message, ProviderConfig, Result,
-    ServerEnvelope, ServerMessage, SessionId,
+    AgentId, Config, GuardrailsConfig, HarnessError, Memory, Message, PermissionMode,
+    ProviderConfig, Result, ServerEnvelope, ServerMessage, SessionId,
 };
 use harness_guardrails::{
     BehaviorMonitor, ContentFence, GuardrailPipeline, PiiDetector, SecretScanner, ToolPolicy,
@@ -136,6 +136,8 @@ struct QueuedMessage {
     /// so a queued message runs at the level it asked for rather than at
     /// whatever the session's config happens to say when its turn arrives.
     effort: Option<String>,
+    /// Permission tier resolved at the same moment, for the same reason.
+    permission: Option<PermissionMode>,
 }
 
 /// The outcome of handing a user message to a session.
@@ -144,6 +146,7 @@ pub(crate) enum Admit {
     Started {
         text: String,
         effort: Option<String>,
+        permission: Option<PermissionMode>,
         control: ControlChannel,
     },
     /// A run was in flight; the text waits at this 1-based queue position.
@@ -174,6 +177,7 @@ pub(crate) enum NextRun {
     Message {
         text: String,
         effort: Option<String>,
+        permission: Option<PermissionMode>,
         control: ControlChannel,
     },
     Job {
@@ -270,10 +274,16 @@ impl SessionRecord {
     ///
     /// `effort` is the already-resolved reasoning level for this run (message >
     /// agent > config), carried through to the loop as a per-run override.
+    /// `permission` is the tier resolved the same way, and travels with it.
     ///
     /// The decision and the queue push share one lock, so a message cannot slip
     /// between a run finishing and its queue being drained.
-    pub(crate) fn admit(&self, text: String, effort: Option<String>) -> Admit {
+    pub(crate) fn admit(
+        &self,
+        text: String,
+        effort: Option<String>,
+        permission: Option<PermissionMode>,
+    ) -> Admit {
         let mut run = self.run.lock();
         if run.control.is_some() {
             if run.queue.len() >= MESSAGE_QUEUE_LIMIT {
@@ -285,6 +295,7 @@ impl SessionRecord {
             run.queue.push_back(QueuedMessage {
                 text: text.clone(),
                 effort,
+                permission,
             });
             return Admit::Queued { text, position };
         }
@@ -293,6 +304,7 @@ impl SessionRecord {
         Admit::Started {
             text,
             effort,
+            permission,
             control,
         }
     }
@@ -360,6 +372,7 @@ impl SessionRecord {
             return Some(NextRun::Message {
                 text: queued.text,
                 effort: queued.effort,
+                permission: queued.permission,
                 control,
             });
         }
@@ -789,11 +802,23 @@ impl ServerState {
 
         let tool_ctx = ToolContext::new(self.workspace_root.clone(), self.config.tools.clone());
         let mut agent_config = runtime.agent_config(session_id);
+        // The session's tier, highest precedence first: the agent's own
+        // declaration, the configured default, then ask-when-needed. The last is
+        // the server default because a UI sits in front of it and can answer; a
+        // headless run defaults to full auto instead.
+        let permission = spec
+            .permission_mode
+            .as_deref()
+            .and_then(PermissionMode::parse)
+            .or(self.config.permissions.mode)
+            .unwrap_or(PermissionMode::AskWhenNeeded);
+        agent_config.permission_mode = permission;
+        agent_config.permission_timeout = Duration::from_secs(self.config.permissions.timeout_secs);
         // The in-flight trim budget comes from the config, so `dhs serve` and
         // `dhs web` trim at the same threshold `dhs run` does.
         agent_config.context_trim_threshold = self.config.context.trim_threshold_chars;
         // Every session gets the pipeline the config asks for, or none at all.
-        if let Some(pipeline) = guardrail_pipeline(&self.config.guardrails)? {
+        if let Some(pipeline) = guardrail_pipeline(&self.config.guardrails, permission)? {
             agent_config = agent_config.with_guardrails(pipeline);
         }
         let agent_id = agent_config.agent_id.clone();
@@ -925,7 +950,10 @@ fn default_spec<'a>(registry: &'a AgentRegistry, configured_default: &str) -> Co
 /// Mirrors `harness run`'s builder: the same deterministic guard set, with the
 /// loop detector's threshold taken from the configuration rather than the
 /// library default.
-fn guardrail_pipeline(config: &GuardrailsConfig) -> Result<Option<Arc<GuardrailPipeline>>> {
+fn guardrail_pipeline(
+    config: &GuardrailsConfig,
+    permission: PermissionMode,
+) -> Result<Option<Arc<GuardrailPipeline>>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -933,7 +961,7 @@ fn guardrail_pipeline(config: &GuardrailsConfig) -> Result<Option<Arc<GuardrailP
         Arc::new(SecretScanner::new()?),
         Arc::new(PiiDetector::new()?),
         Arc::new(ContentFence::new()?),
-        Arc::new(ToolPolicy::destructive_defaults()?),
+        Arc::new(ToolPolicy::destructive_defaults()?.with_mode(permission)),
         Arc::new(BehaviorMonitor::new(config.max_identical_tool_calls)),
     ]))))
 }
