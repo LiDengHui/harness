@@ -1,9 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import type { LocationQueryRaw } from 'vue-router';
 
-import { carryToken, type NavigationTarget } from './navigation';
+import { accessToken, carryToken, forgetAccessToken, type NavigationTarget } from './token';
 
-const TOKEN = '8fdbe66ff149163c5aa694a2de7a010c';
+const TOKEN = 'd622e608208f088708872f368c610b5c';
 
 const target = (path: string, query: LocationQueryRaw = {}): NavigationTarget => ({
   path,
@@ -11,10 +11,40 @@ const target = (path: string, query: LocationQueryRaw = {}): NavigationTarget =>
   hash: '',
 });
 
+beforeEach(() => {
+  forgetAccessToken();
+});
+
+describe('accessToken', () => {
+  it('captures the token from the URL the server opened', () => {
+    expect(accessToken(`?token=${TOKEN}`)).toBe(TOKEN);
+  });
+
+  it('still answers after a navigation that dropped the query', () => {
+    // The bug this exists for: the router rewrites the address bar, so reading
+    // the token from it per request is what made a menu click break the app.
+    accessToken(`?token=${TOKEN}`);
+    expect(accessToken('')).toBe(TOKEN);
+  });
+
+  it('lets a URL that names a token win, so a restart takes effect', () => {
+    accessToken(`?token=${TOKEN}`);
+    expect(accessToken('?token=newer')).toBe('newer');
+  });
+
+  it('answers null when no token was ever handed out, as on a loopback bind', () => {
+    expect(accessToken('')).toBeNull();
+  });
+
+  it('forgets on request, which is what the tests need between cases', () => {
+    accessToken(`?token=${TOKEN}`);
+    forgetAccessToken();
+    expect(accessToken('')).toBeNull();
+  });
+});
+
 describe('carryToken', () => {
   it('puts the token back on a link that dropped it', () => {
-    // The bug this exists for: clicking the top navigation took the app to
-    // `/agents`, the query vanished, and every request from there answered 401.
     expect(carryToken(target('/agents'), { query: {} }, `?token=${TOKEN}`)).toEqual({
       path: '/agents',
       query: { token: TOKEN },

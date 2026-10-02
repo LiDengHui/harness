@@ -14,6 +14,7 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue';
 
 import { i18n } from '../i18n';
+import { accessToken } from '../token';
 import {
   type ClientMessage,
   type ClientRouting,
@@ -137,9 +138,11 @@ export function defaultWebSocketUrl(): string {
   }
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   // A server bound to the network requires the token it printed, and it arrives
-  // in this page's URL. Without this the socket is refused and the UI sits
-  // disconnected with no way for the reader to tell why.
-  const token = new URLSearchParams(location.search).get('token');
+  // in the page the server opened. It is taken from the capture rather than the
+  // address bar, because a reconnect outlives a navigation: reading the current
+  // URL here is how a socket that dropped after a menu click came back refused,
+  // leaving the UI disconnected with no way for the reader to tell why.
+  const token = accessToken(location.search);
   const query = token ? `?token=${encodeURIComponent(token)}` : '';
   return `${scheme}//${location.host}/ws${query}`;
 }

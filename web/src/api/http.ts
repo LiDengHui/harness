@@ -8,6 +8,7 @@
  */
 
 import { i18n } from '../i18n';
+import { accessToken } from '../token';
 
 /** What went wrong, as a code the UI can word for itself. */
 export type ApiFailureCode = 'unreachable' | 'status' | 'invalid_json';
@@ -96,13 +97,13 @@ export class ApiError extends Error {
 /**
  * The token the server prints when it is bound to the network.
  *
- * It arrives in the URL the CLI opens, so it is read from there rather than
- * stored: a token that outlives the tab it was handed to is a token nobody
- * remembers issuing. Absent on a loopback bind, where the server asks for none.
+ * It arrives in the URL the CLI opens, and `accessToken` captures it there so a
+ * request does not depend on the address bar still naming it. Absent on a
+ * loopback bind, where the server asks for none.
  */
 function withToken(path: string): string {
   if (typeof location === 'undefined') return path;
-  const token = new URLSearchParams(location.search).get('token');
+  const token = accessToken(location.search);
   if (!token) return path;
   const separator = path.includes('?') ? '&' : '?';
   return `${path}${separator}token=${encodeURIComponent(token)}`;

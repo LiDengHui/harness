@@ -1,6 +1,6 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 
-import { carryToken } from './navigation';
+import { carryToken } from './token';
 import ChatView from './views/ChatView.vue';
 
 const routes: RouteRecordRaw[] = [
