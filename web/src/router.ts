@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 
+import { carryToken } from './navigation';
 import ChatView from './views/ChatView.vue';
 
 const routes: RouteRecordRaw[] = [
@@ -18,3 +19,5 @@ export const router = createRouter({
   history: createWebHistory(),
   routes,
 });
+
+router.beforeEach((to, from) => carryToken(to, from, location.search));
